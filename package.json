@@ -5,14 +5,19 @@
   "description": "Open-source x402 payment facilitator for Stellar (USDC via Soroban auth entries) with Bazaar-style discovery.",
   "license": "Apache-2.0",
   "type": "module",
-  "engines": { "node": ">=24" },
-  "workspaces": ["packages/*", "examples/*"],
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --noEmit false",
     "test": "vitest run",
     "test:testnet": "STELLAR_TESTNET_TESTS=1 vitest run",
-    "demo:testnet": "tsx examples/payer/demo.ts"
+    "demo:testnet": "tsx examples/payer/src/cli.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

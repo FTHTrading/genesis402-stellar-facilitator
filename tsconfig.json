@@ -3,6 +3,8 @@
   "references": [
     { "path": "packages/facilitator" },
     { "path": "packages/seller-sdk" },
-    { "path": "packages/discovery" }
+    { "path": "packages/discovery" },
+    { "path": "examples/reference-seller" },
+    { "path": "examples/payer" }
   ]
 }

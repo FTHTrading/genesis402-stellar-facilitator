@@ -1,2 +1,17 @@
-{ "name": "@genesis402/example-payer", "version": "0.1.0", "private": true, "license": "Apache-2.0", "type": "module",
-  "dependencies": { "@genesis402/stellar-facilitator": "0.1.0", "@genesis402/stellar-discovery": "0.1.0", "@genesis402/example-reference-seller": "0.1.0", "@stellar/stellar-sdk": "^17.3.0" } }
+{
+  "name": "@genesis402/example-payer",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "@genesis402/stellar-facilitator": "0.1.0",
+    "@genesis402/stellar-discovery": "0.1.0",
+    "@genesis402/example-reference-seller": "0.1.0",
+    "@stellar/stellar-sdk": "^17.3.0",
+    "@hono/node-server": "^2.1.5"
+  },
+  "scripts": {
+    "demo": "tsx src/cli.ts"
+  }
+}
