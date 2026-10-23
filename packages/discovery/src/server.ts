@@ -17,12 +17,20 @@ try {
   /* leave argv[1] as given */
 }
 if (process.argv[1] && import.meta.url === new URL("file:///" + process.argv[1].replace(/\\/g, "/").replace(/^\/+/, "")).href) {
+  const strictInt = (name: string, fallback: number, min: number): number => {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === "") return fallback;
+    if (!/^\d{1,9}$/.test(raw.trim()) || Number(raw) < min) {
+      throw new Error(`${name} must be a plain integer >= ${min} (got "${raw}")`);
+    }
+    return Number(raw);
+  };
   const index = new SqliteResourceIndex(process.env["DISCOVERY_DB_PATH"] ?? "./discovery.sqlite");
-  const port = Number(process.env["PORT"] ?? 4022);
+  const port = strictInt("PORT", 4022, 0);
   const app = createDiscoveryApp({
     index,
     trustProxy: process.env["TRUST_PROXY"] === "1",
-    trustProxyHops: Number(process.env["TRUST_PROXY_HOPS"] ?? 1),
+    trustProxyHops: strictInt("TRUST_PROXY_HOPS", 1, 1),
     allowLocalTargets: process.env["DISCOVERY_ALLOW_LOCAL"] === "1",
   });
   serve({ fetch: app.fetch, port }, (info) => {

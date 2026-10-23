@@ -9,6 +9,8 @@ import {
 
 export interface SellerOptions {
   facilitatorUrl: string;
+  /** Bearer token when the facilitator runs with SELLER_TOKENS. */
+  facilitatorToken?: string;
   /** Seller's Stellar address that receives USDC. */
   payTo: string;
   network: string;
@@ -67,6 +69,7 @@ export const SERVICES: ServiceInput[] = [
 export function createSellerApp(opts: SellerOptions): { app: Hono; paywall: Paywall } {
   const paywall = createPaywall({
     facilitatorUrl: opts.facilitatorUrl,
+    ...(opts.facilitatorToken ? { facilitatorToken: opts.facilitatorToken } : {}),
     payTo: opts.payTo,
     network: opts.network,
     ...(opts.asset ? { asset: opts.asset } : {}),

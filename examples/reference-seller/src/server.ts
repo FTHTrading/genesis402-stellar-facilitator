@@ -5,6 +5,7 @@ import { createSellerApp } from "./index.js";
 /**
  * Standalone reference seller.
  *   FACILITATOR_URL   e.g. http://localhost:4021
+ *   FACILITATOR_TOKEN bearer token, required when the facilitator runs with SELLER_TOKENS
  *   SELLER_ADDRESS    G... that receives USDC
  *   STELLAR_NETWORK   stellar:testnet (default)
  *   ASSET_CONTRACT    optional token contract (default USDC on the network)
@@ -21,8 +22,10 @@ if (process.argv[1] && import.meta.url === new URL("file:///" + process.argv[1].
   const payTo = process.env["SELLER_ADDRESS"];
   if (!payTo) throw new Error("SELLER_ADDRESS is required");
   const asset = process.env["ASSET_CONTRACT"];
+  const token = process.env["FACILITATOR_TOKEN"]?.trim();
   const { app } = createSellerApp({
     facilitatorUrl: process.env["FACILITATOR_URL"] ?? "http://localhost:4021",
+    ...(token ? { facilitatorToken: token } : {}),
     payTo,
     network: process.env["STELLAR_NETWORK"] ?? "stellar:testnet",
     ...(asset ? { asset } : {}),

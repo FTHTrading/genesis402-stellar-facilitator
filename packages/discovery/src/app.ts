@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import { getConnInfo } from "@hono/node-server/conninfo";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
@@ -206,9 +207,10 @@ export function clientKey(c: Context, trustProxy: boolean, hops = 1): { key: str
   const realIp = c.req.header("x-real-ip");
   if (trustProxy) {
     const chain = (xff ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-    const n = Math.max(1, Math.floor(hops));
-    const ip = chain.length >= n ? chain[chain.length - n] : chain.length > 0 ? chain[0] : realIp?.trim();
-    if (ip) return { key: `proxy:${ip}`, identified: true };
+    // A malformed or oversized hop count never falls back to the leftmost (client-chosen) entry: use the rightmost.
+    const n = Number.isSafeInteger(hops) && hops >= 1 ? hops : 1;
+    const ip = chain.length >= n ? chain[chain.length - n] : chain.length > 0 ? chain[chain.length - 1] : realIp?.trim();
+    if (ip) return { key: `proxy:${bucketOf(ip)}`, identified: true };
   }
   let socketIp: string | undefined;
   try {
@@ -216,7 +218,37 @@ export function clientKey(c: Context, trustProxy: boolean, hops = 1): { key: str
   } catch {
     socketIp = undefined;
   }
-  if (socketIp) return { key: `socket:${socketIp}`, identified: true };
+  if (socketIp) return { key: `socket:${bucketOf(socketIp)}`, identified: true };
   if (xff || realIp) return { key: "untrusted-forwarded", identified: true };
   return { key: "unidentified", identified: false };
+}
+
+/**
+ * Rate-limit identity for an address: IPv4 per address, IPv6 per /64 (one
+ * subscriber prefix; per-address buckets would hand a client 2^64 identities).
+ * Anything that is not an IP literal is kept as-is, lower-cased.
+ */
+export function bucketOf(ip: string): string {
+  const s = ip.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  const v = isIP(s);
+  if (v === 4) return s;
+  if (v === 6) {
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(s);
+    if (mapped) return mapped[1]!;
+    const groups = expand6(s);
+    return groups ? `${groups.slice(0, 4).map((g) => g.toString(16)).join(":")}::/64` : s;
+  }
+  return s;
+}
+
+function expand6(a: string): number[] | undefined {
+  const [head, tail, extra] = a.split("::");
+  if (extra !== undefined) return undefined;
+  const parse = (x: string | undefined) => (x ? x.split(":").filter(Boolean).map((h) => parseInt(h, 16)) : []);
+  const h = parse(head);
+  const t = tail === undefined ? [] : parse(tail);
+  const fill = 8 - h.length - t.length;
+  if (fill < 0 || (tail === undefined && h.length !== 8)) return undefined;
+  const g = [...h, ...Array<number>(fill).fill(0), ...t];
+  return g.some((x) => Number.isNaN(x)) ? undefined : g;
 }
