@@ -93,7 +93,11 @@ export function createApp(facilitator: StellarFacilitator, options: AppOptions =
     // Scope the claim to the authenticated seller: the stored key is H(token || key), so another token with the same key never matches.
     const claimKey =
       key && CLAIM_KEY.test(key) ? (auth.tokenId ? createHash("sha256").update(`${auth.tokenId}|${key}`).digest("hex") : key) : undefined;
-    const result = await facilitator.settle(paymentPayload, paymentRequirements, claimKey ? { claimKey } : {});
+    // In bearer mode the fee share is keyed by the authenticated token, not by payTo (M-r4-2).
+    const result = await facilitator.settle(paymentPayload, paymentRequirements, {
+      ...(claimKey ? { claimKey } : {}),
+      ...(auth.tokenId ? { sellerId: `token:${auth.tokenId}` } : {}),
+    });
     if (
       result.errorReason === "fee_budget_exhausted" ||
       result.errorReason === "seller_fee_budget_exhausted" ||

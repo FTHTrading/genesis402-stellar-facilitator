@@ -109,8 +109,9 @@ describe("I-4r3 per-seller fee share", () => {
   it("defaults to a quarter of the global budget, never below one maximum-fee settlement", () => {
     const chain = () => new MockChain({ currentLedger: CURRENT_LEDGER, facilitatorAddress: facilitator.publicKey() });
     expect(mk(chain()).feeBudgetPerSellerStroopsPerHour).toBe(1_250_000);
-    // A tiny global budget still lets one seller make one settlement: the share floors at maxTransactionFeeStroops.
-    expect(mk(chain(), { feeBudgetStroopsPerHour: 1_000 }).feeBudgetPerSellerStroopsPerHour).toBe(50_000);
+    // The share floors at maxTransactionFeeStroops but is clamped to the budget itself: with 1,000 the share is 1,000.
+    expect(mk(chain(), { feeBudgetStroopsPerHour: 1_000 }).feeBudgetPerSellerStroopsPerHour).toBe(1_000);
+    expect(mk(chain(), { feeBudgetStroopsPerHour: 1_000_000, maxTransactionFeeStroops: 50_000 }).feeBudgetPerSellerStroopsPerHour).toBe(250_000);
     expect(mk(chain(), { feeBudgetStroopsPerHour: 1_000_000, maxTransactionFeeStroops: 10_000 }).feeBudgetPerSellerStroopsPerHour).toBe(250_000);
   });
 

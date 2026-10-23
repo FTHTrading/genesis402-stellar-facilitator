@@ -64,8 +64,9 @@ export interface FacilitatorOptions {
    */
   feeBudgetStroopsPerHour?: number;
   /**
-   * Fees one `payTo` may consume per trailing hour. Default: a quarter of the
-   * global budget, but never less than one maximum-fee settlement
+   * Fees one seller (payTo, or the bearer token in bearer mode) may consume per
+   * trailing hour. Default: a quarter of the global budget, but never less than
+   * one maximum-fee settlement
    * (`max(floor(budget / 4), maxTransactionFeeStroops)`), so a single seller —
    * honest or hostile — can never take the hour from everyone else; it takes
    * four distinct sellers acting together to exhaust the global budget. With
@@ -87,6 +88,12 @@ export interface SettleOptions {
    * outcome back; any other key gets `nonce_reused`.
    */
   claimKey?: string;
+  /**
+   * Who is being rate-limited for the fee share. Default: `payTo`. In bearer
+   * mode the API passes the authenticated token's id, so one seller cannot
+   * widen its share by rotating payTo addresses.
+   */
+  sellerId?: string;
 }
 
 type Static = Extract<StaticResult, { ok: true }>;
@@ -187,12 +194,17 @@ export class StellarFacilitator {
     const deadline = opts.settleDeadlineMs;
     this.settleDeadlineMs = deadline !== undefined && Number.isSafeInteger(deadline) && deadline > 0 ? deadline : DEFAULT_SETTLE_DEADLINE_MS;
     this.feeBudgetStroopsPerHour = guardInt(opts.feeBudgetStroopsPerHour, DEFAULT_FEE_BUDGET_STROOPS_PER_HOUR, "feeBudgetStroopsPerHour", warn);
-    this.feeBudgetPerSellerStroopsPerHour = guardInt(
-      opts.feeBudgetPerSellerStroopsPerHour,
+    // Default share: a quarter of the hour, never below one maximum-fee settlement, never above the hour itself.
+    const defaultShare = Math.min(
       Math.max(Math.floor(this.feeBudgetStroopsPerHour / 4), this.maxTransactionFeeStroops),
-      "feeBudgetPerSellerStroopsPerHour",
-      warn,
+      this.feeBudgetStroopsPerHour,
     );
+    this.feeBudgetPerSellerStroopsPerHour = guardInt(opts.feeBudgetPerSellerStroopsPerHour, defaultShare, "feeBudgetPerSellerStroopsPerHour", warn);
+    if (opts.feeBudgetPerSellerStroopsPerHour !== undefined && this.feeBudgetPerSellerStroopsPerHour > this.feeBudgetStroopsPerHour) {
+      throw new Error(
+        `feeBudgetPerSellerStroopsPerHour (${this.feeBudgetPerSellerStroopsPerHour}) exceeds feeBudgetStroopsPerHour (${this.feeBudgetStroopsPerHour}); one seller could take the whole hour`,
+      );
+    }
     this.maxSettlesPerSellerPerHour = guardInt(opts.maxSettlesPerSellerPerHour, DEFAULT_MAX_SETTLES_PER_SELLER_PER_HOUR, "maxSettlesPerSellerPerHour", warn);
     this.now = opts.now ?? (() => Date.now());
     this.feeWindow = new HourWindow(this.now);
@@ -238,6 +250,7 @@ export class StellarFacilitator {
   ): Promise<SettleResponse> {
     const network = payload.accepted?.network ?? requirements.network;
     const claimKey = options.claimKey ?? "";
+    const sellerId = options.sellerId || requirements.payTo;
     const failed = (errorReason: string, payer?: string, transaction = ""): SettleResponse => ({
       success: false,
       errorReason,
@@ -254,7 +267,7 @@ export class StellarFacilitator {
       return failed(s.reason, s.payer);
     }
 
-    return this.lock.run(() => this.critical(s, requirements, claimKey, network, failed));
+    return this.lock.run(() => this.critical(s, requirements, claimKey, sellerId, network, failed));
   }
 
   /**
@@ -268,6 +281,7 @@ export class StellarFacilitator {
     s: Static,
     requirements: PaymentRequirements,
     claimKey: string,
+    sellerId: string,
     network: string,
     failed: (reason: string, payer?: string, transaction?: string) => SettleResponse,
   ): Promise<SettleResponse> {
@@ -297,16 +311,22 @@ export class StellarFacilitator {
         this.log(`fee budget exhausted: ${this.feeWindow.total()} + ${p.feeStroops} > ${this.feeBudgetStroopsPerHour}`);
         return failed("fee_budget_exhausted", s.payer);
       }
-      const sellerFee = this.window(this.sellerFees, requirements.payTo);
+      const sellerFee = this.window(this.sellerFees, sellerId);
       if (sellerFee.total() + p.feeStroops > this.feeBudgetPerSellerStroopsPerHour) {
-        this.log(`seller fee share exhausted for ${requirements.payTo}`);
+        this.log(`seller fee share exhausted for ${sellerId}`);
         return failed("seller_fee_budget_exhausted", s.payer);
       }
-      const sellerCount = this.window(this.sellerCount, requirements.payTo);
+      const sellerCount = this.window(this.sellerCount, sellerId);
       if (sellerCount.total() + 1 > this.maxSettlesPerSellerPerHour) {
-        this.log(`seller cap reached for ${requirements.payTo}`);
+        this.log(`seller cap reached for ${sellerId}`);
         return failed("seller_rate_limited", s.payer);
       }
+      // Anything from here on may have cost a fee. Ambiguous outcomes are charged at the ceiling (M-r4-3).
+      const chargeAmbiguous = () => {
+        this.feeWindow.add(this.maxTransactionFeeStroops);
+        sellerFee.add(this.maxTransactionFeeStroops);
+        sellerCount.add(1);
+      };
 
       let tx: Transaction;
       let hash: string;
@@ -343,12 +363,14 @@ export class StellarFacilitator {
         // Ambiguous: the envelope may have reached a node. Keep the claim; report the hash for reconciliation.
         this.log(`sendTransaction threw for ${hash}`, err);
         this.safeStatus(s, "submitted");
+        chargeAmbiguous();
         return failed("unexpected_settle_error", s.payer, hash);
       }
       if (sent.status === "AMBIGUOUS") {
         // A lost attempt may have been admitted; the later answer proves nothing. Keep the claim, hand back the hash.
         this.log(`sendTransaction ambiguous for ${hash}: ${sent.error ?? ""}`);
         this.safeStatus(s, "submitted");
+        chargeAmbiguous();
         return failed("unexpected_settle_error", s.payer, hash);
       }
       if (sent.status !== "PENDING") {
@@ -451,10 +473,12 @@ export class StellarFacilitator {
     let currentLedger: number;
     let estimatedLedgerSeconds: number;
     try {
-      [currentLedger, estimatedLedgerSeconds] = await Promise.all([
-        this.chain.getLatestLedger(),
-        this.chain.estimatedLedgerSeconds(),
-      ]);
+      // Bounded like the critical section: a stalled RPC must not hold a seller's request (and its lock) open.
+      [currentLedger, estimatedLedgerSeconds] = await bounded(
+        Promise.all([this.chain.getLatestLedger(), this.chain.estimatedLedgerSeconds()]),
+        this.settleDeadlineMs,
+        "ledger lookup",
+      );
     } catch (err) {
       this.log("ledger lookup failed", err);
       return { ok: false, reason: "unexpected_verify_error" };
@@ -571,6 +595,22 @@ export class StellarFacilitator {
       this.log("nonce status update failed", err);
     }
   }
+}
+
+function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${what} exceeded ${ms} ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
 }
 
 function invalid(i: Invalid): VerifyResponse {
