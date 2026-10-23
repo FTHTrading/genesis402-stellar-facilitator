@@ -141,11 +141,15 @@ describe("I-3r2 pending state terminates", () => {
       const r2 = await call(pw, h);
       expect(r2.kind).toBe("payment_required");
       if (r2.kind === "payment_required") expect(r2.body.error).toBe("settlement_expired");
-      // Record dropped: the next request is a fresh attempt (goes through /verify again).
+      // Tombstone (r3 M-r3-2): the record keeps its claim key, so a later retry re-asks /settle with it and never re-verifies.
       setFault("none");
-      const before = calls.filter((c) => c.path === "/verify").length;
-      await call(pw, h);
-      expect(calls.filter((c) => c.path === "/verify").length).toBe(before + 1);
+      const verifies = calls.filter((c) => c.path === "/verify").length;
+      const settles = calls.filter((c) => c.path === "/settle").length;
+      const r3 = await call(pw, h);
+      if (r3.kind === "payment_required") expect(r3.body.error).toBe("settlement_expired");
+      expect(calls.filter((c) => c.path === "/verify").length).toBe(verifies);
+      expect(calls.filter((c) => c.path === "/settle").length).toBe(settles + 1);
+      expect(new Set(calls.filter((c) => c.path === "/settle").map((c) => c.key)).size).toBe(1);
     } finally {
       vi.useRealTimers();
     }

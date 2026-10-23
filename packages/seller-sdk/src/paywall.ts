@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { InMemoryPendingStore, type PendingRecord, type PendingStore } from "./pending-store.js";
 import {
   HEADER_PAYMENT_LEGACY,
   HEADER_PAYMENT_REQUIRED,
@@ -24,11 +25,17 @@ const DEFAULT_HORIZON: Readonly<Record<string, string>> = {
 };
 
 export type ChainStatus = "SUCCESS" | "FAILED" | "UNKNOWN";
-export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS";
 
 export interface PaywallConfig {
-  /** Base URL of a Stellar x402 facilitator exposing /verify and /settle. Userinfo becomes an Authorization header. */
+  /**
+   * Base URL of a Stellar x402 facilitator exposing /verify and /settle.
+   * Credentials in the URL: `https://TOKEN@host`, `https://:TOKEN@host` or
+   * `https://bearer:TOKEN@host` become `Authorization: Bearer TOKEN`; a
+   * `user:password` pair (user not "bearer") becomes Basic. Prefer `facilitatorToken`.
+   */
   facilitatorUrl: string;
+  /** Bearer token for a facilitator running with SELLER_TOKENS. Sent as `Authorization: Bearer`. */
+  facilitatorToken?: string;
   /** Seller's Stellar address (G... or C...). */
   payTo: string;
   /** CAIP-2 network, e.g. stellar:testnet. */
@@ -46,11 +53,18 @@ export interface PaywallConfig {
   confirmAttempts?: number;
   confirmDelayMs?: number;
   /**
-   * Extra seconds a `settlement_pending` record stays alive after the
+   * Extra seconds a `settlement_pending` record stays retryable after the
    * payment's own validity (`maxTimeoutSeconds` for the envelope time bounds
    * and again for the auth-entry expiry) has run out. Default 30.
    */
   pendingGraceSeconds?: number;
+  /**
+   * Where in-progress payments are remembered (claim key, hash). Default: in
+   * memory, per instance. Pass a `SqlitePendingStore` (or any shared
+   * implementation) so a restarted or scaled-out seller can still finish a
+   * payment whose facilitator answer was lost.
+   */
+  pendingStore?: PendingStore;
 }
 
 export interface HandleInput {
@@ -87,17 +101,10 @@ export interface Paywall {
 /** Fixed, client-safe reason codes. Anything else from upstream is collapsed to one of these. */
 const CODE = /^[a-z0-9_]{1,80}$/;
 const PENDING_RETRY = "Re-send the same PAYMENT-SIGNATURE to this resource. Do not sign a new payment.";
-const MAX_PENDING = 1000;
 
-interface Pending {
-  resourceKey: string;
-  requirements: PaymentRequirements;
-  /** The claim identity this seller used on /settle; a retry re-uses it, so only this seller's claim can be read back. */
-  claimKey: string;
-  txHash?: string;
-  createdAt: number;
-  expiresAt: number;
-}
+type FacilitatorCall<T> =
+  | { ok: true; value: T }
+  | { ok: false; code: "facilitator_unreachable" | "facilitator_error" | "facilitator_refused"; definitive: boolean };
 
 /**
  * Framework-agnostic x402 paywall for Stellar. Pay-first: a request carrying
@@ -105,33 +112,31 @@ interface Pending {
  * resource handler runs; the receipt is returned in PAYMENT-RESPONSE.
  *
  * One payment buys exactly one delivery:
- * - requests carrying the same header are processed one at a time; after the
- *   first delivery every later one is refused by the facilitator (`nonce_reused`)
- *   and the seller never delivers on that answer;
+ * - all work on one payment digest is serialized through the pending store's
+ *   lock (across every instance sharing the store);
  * - a payment is bound to method + origin + path of the resource it quoted;
- * - when settlement is ambiguous (facilitator 5xx, confirmation lost) the buyer
- *   gets HTTP 409 `settlement_pending` with the same terms; the seller keeps a
- *   pending record (payment digest -> claim key, hash) and the buyer re-sends
- *   the same header. The retry re-asks the facilitator **with the same claim
- *   key**, so only this seller's own claim can turn into a delivery; two
- *   concurrent retries yield one delivery;
- * - a pending record expires once the envelope time bounds and the auth-entry
- *   expiry have both passed with no inclusion; the next retry gets a terminal
- *   402 with a fresh quote and the record is dropped;
+ * - before `/settle` the seller writes a record {digest -> claim key}; a lost
+ *   answer leaves that record, and the buyer's retry re-asks `/settle` **with
+ *   the same claim key**, which only this seller holds; `nonce_reused` is never
+ *   turned into a delivery;
+ * - after the envelope time bounds and auth expiry have passed, the record
+ *   becomes a tombstone: the retry still re-asks with the claim key (a late
+ *   landing is served), otherwise it gets a terminal 402 and a fresh quote;
+ * - a definitive refusal from the facilitator (4xx) is a 402, never a 409;
  * - every error field is a fixed code; upstream text is never forwarded.
  */
 export function createPaywall(cfg: PaywallConfig): Paywall {
   const asset = cfg.asset ?? USDC_SAC[cfg.network];
   if (!asset) throw new Error(`No default asset for ${cfg.network}; pass asset explicitly`);
   const fetchImpl = cfg.fetch ?? globalThis.fetch;
-  const { base: facilitatorUrl, authorization } = splitCredentials(cfg.facilitatorUrl);
+  const { base: facilitatorUrl, authorization: urlAuth } = splitCredentials(cfg.facilitatorUrl);
+  const authorization = cfg.facilitatorToken ? `Bearer ${cfg.facilitatorToken.trim()}` : urlAuth;
   const horizonUrl = (cfg.horizonUrl ?? DEFAULT_HORIZON[cfg.network] ?? "").replace(/\/$/, "");
   const confirmAttempts = cfg.confirmAttempts ?? 3;
   const confirmDelayMs = cfg.confirmDelayMs ?? 1500;
   const confirm = cfg.confirm ?? ((hash: string) => horizonStatus(fetchImpl, horizonUrl, hash));
   const graceMs = (cfg.pendingGraceSeconds ?? 30) * 1000;
-  const pending = new Map<string, Pending>();
-  const inFlight = new Map<string, Promise<unknown>>();
+  const store: PendingStore = cfg.pendingStore ?? new InMemoryPendingStore();
 
   const config = {
     facilitatorUrl,
@@ -171,42 +176,34 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     };
   };
 
-  const pend = (digest: string, resource: ResourceInfo, req: PaymentRequirements, claimKey: string, txHash?: string): HandleResult => {
-    const existing = pending.get(digest);
-    if (!existing && pending.size >= MAX_PENDING) {
-      const oldest = pending.keys().next().value;
-      if (oldest) pending.delete(oldest);
-    }
-    const now = Date.now();
-    const ttlMs = req.maxTimeoutSeconds * 2 * 1000 + graceMs;
-    pending.set(digest, {
-      resourceKey: resourceKey(resource.url),
-      requirements: req,
-      claimKey,
-      createdAt: existing?.createdAt ?? now,
-      expiresAt: existing?.expiresAt ?? now + ttlMs,
-      ...(txHash ? { txHash } : existing?.txHash ? { txHash: existing.txHash } : {}),
-    });
-    const body: SettlementPendingBody = {
+  const pendingAnswer = (resource: ResourceInfo, req: PaymentRequirements, txHash?: string): HandleResult => ({
+    kind: "settlement_pending",
+    status: 409,
+    headers: { "content-type": "application/json", "retry-after": String(Math.ceil(confirmDelayMs / 1000) || 1) },
+    body: {
       x402Version: 2,
       error: "settlement_pending",
       resource,
       accepts: [req],
       ...(txHash ? { transaction: txHash } : {}),
       retry: PENDING_RETRY,
-    };
-    return {
-      kind: "settlement_pending",
-      status: 409,
-      headers: { "content-type": "application/json", "retry-after": String(Math.ceil(confirmDelayMs / 1000) || 1) },
-      body,
-    };
-  };
+    },
+  });
 
-  const paid = (digest: string, settlement: SettleResponse, payer: string | undefined): HandleResult => {
-    pending.delete(digest);
-    return { kind: "paid", headers: { [HEADER_PAYMENT_RESPONSE]: encodeHeader(settlement) }, settlement, payer };
-  };
+  const receipt = (hash: string, req: PaymentRequirements, payer: string | undefined): SettleResponse => ({
+    success: true,
+    transaction: hash,
+    network: req.network,
+    ...(payer ? { payer } : {}),
+    amount: req.amount,
+  });
+
+  const paidResult = (settlement: SettleResponse, payer: string | undefined): HandleResult => ({
+    kind: "paid",
+    headers: { [HEADER_PAYMENT_RESPONSE]: encodeHeader(settlement) },
+    settlement,
+    payer,
+  });
 
   async function callFacilitator<T>(
     path: "/verify" | "/settle",
@@ -214,7 +211,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     paymentRequirements: PaymentRequirements,
     parse: (v: unknown) => T,
     claimKey?: string,
-  ): Promise<{ ok: true; value: T } | { ok: false; code: "facilitator_unreachable" | "facilitator_error" }> {
+  ): Promise<FacilitatorCall<T>> {
     let res: Response;
     try {
       res = await fetchImpl(`${facilitatorUrl}${path}`, {
@@ -227,13 +224,15 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
         body: JSON.stringify({ x402Version: 2, paymentPayload, paymentRequirements }),
       });
     } catch {
-      return { ok: false, code: "facilitator_unreachable" };
+      return { ok: false, code: "facilitator_unreachable", definitive: false };
     }
-    if (!res.ok) return { ok: false, code: res.status >= 500 ? "facilitator_unreachable" : "facilitator_error" };
+    if (res.status >= 500) return { ok: false, code: "facilitator_unreachable", definitive: false };
+    // 4xx is the facilitator refusing before any claim (auth, budget, malformed): definitive, nothing is pending.
+    if (!res.ok) return { ok: false, code: "facilitator_refused", definitive: true };
     try {
       return { ok: true, value: parse(await res.json()) };
     } catch {
-      return { ok: false, code: "facilitator_error" };
+      return { ok: false, code: "facilitator_error", definitive: false };
     }
   }
 
@@ -251,92 +250,84 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     return "UNKNOWN";
   }
 
-  const receipt = (hash: string, req: PaymentRequirements, payer: string | undefined): SettleResponse => ({
-    success: true,
-    transaction: hash,
-    network: req.network,
-    ...(payer ? { payer } : {}),
-    amount: req.amount,
-  });
-
-  /** Outcome of a /settle answer that is not a clean success; `hash` is whatever we know. */
+  /** Decide from a /settle answer made under `rec.claimKey` (ours). */
   async function afterSettle(
-    digest: string,
-    settle: SettleResponse,
+    rec: PendingRecord,
+    call: FacilitatorCall<SettleResponse>,
     resource: ResourceInfo,
-    req: PaymentRequirements,
-    claimKey: string,
     price: string,
     method: string,
     payer: string | undefined,
   ): Promise<HandleResult> {
-    if (settle.success) return paid(digest, settle, settle.payer ?? payer);
+    const req = rec.requirements;
+    const expired = rec.state === "expired";
+    const keep = async (txHash?: string): Promise<HandleResult> => {
+      await store.put({ ...rec, state: expired ? "expired" : "pending", ...(txHash ? { txHash } : {}) });
+      return expired ? deny(price, resource, "settlement_expired", method) : pendingAnswer(resource, req, txHash ?? rec.txHash);
+    };
+    if (!call.ok) {
+      if (call.definitive) {
+        await store.delete(rec.digest);
+        return deny(price, resource, call.code, method);
+      }
+      return keep();
+    }
+    const settle = call.value;
+    if (settle.success) {
+      await store.delete(rec.digest);
+      return paidResult(settle, settle.payer ?? payer);
+    }
     const reason = settle.errorReason ?? "settlement_failed";
     // Someone else's claim. Never a delivery, whatever the chain says.
     if (reason === "invalid_exact_stellar_payload_nonce_reused") {
-      pending.delete(digest);
+      await store.delete(rec.digest);
       return deny(price, resource, reason, method);
     }
-    // The facilitator read the ledger and saw the envelope fail: definitive.
     if (reason === "settle_exact_stellar_transaction_failed") {
-      pending.delete(digest);
+      await store.delete(rec.digest);
       return deny(price, resource, reason, method);
     }
     const hash = settle.transaction || undefined;
     if (!hash) {
-      // Nothing was submitted under our claim (e.g. submission refused): the entry is unspent; quote again.
-      if (reason === "settle_exact_stellar_transaction_submission_failed" || reason === "nonce_store_unavailable") {
-        pending.delete(digest);
-        return deny(price, resource, reason, method);
-      }
-      return pend(digest, resource, req, claimKey);
+      // Nothing was submitted under our claim: the entry is unspent; quote again.
+      await store.delete(rec.digest);
+      return deny(price, resource, reason, method);
     }
     const status = await confirmed(hash);
-    if (status === "SUCCESS") return paid(digest, receipt(hash, req, settle.payer ?? payer), settle.payer ?? payer);
+    if (status === "SUCCESS") {
+      await store.delete(rec.digest);
+      return paidResult(receipt(hash, req, settle.payer ?? payer), settle.payer ?? payer);
+    }
     if (status === "FAILED") {
-      pending.delete(digest);
+      await store.delete(rec.digest);
       return deny(price, resource, "settle_exact_stellar_transaction_failed", method);
     }
-    return pend(digest, resource, req, claimKey, hash);
+    return keep(hash);
   }
 
-  /** A pending settlement retried with the same header: our own claim, re-asked with our own claim key. */
-  async function resumePending(
-    digest: string,
-    entry: Pending,
-    payload: PaymentPayload,
-    resource: ResourceInfo,
-    price: string,
-    method: string,
-  ): Promise<HandleResult> {
-    const req = entry.requirements;
-    if (Date.now() >= entry.expiresAt) {
-      // Envelope time bounds and auth expiry have passed. One last look at the chain, then terminal.
-      if (entry.txHash) {
-        const status = await confirmed(entry.txHash);
-        if (status === "SUCCESS") return paid(digest, receipt(entry.txHash, req, undefined), undefined);
-      }
-      pending.delete(digest);
-      return deny(price, resource, "settlement_expired", method);
+  /** A payment we have a record for: our claim, re-asked with our own claim key. */
+  async function resume(rec: PendingRecord, payload: PaymentPayload, resource: ResourceInfo, price: string, method: string): Promise<HandleResult> {
+    if (rec.state !== "expired" && Date.now() >= rec.expiresAt) {
+      rec = { ...rec, state: "expired" };
+      await store.put(rec);
     }
-    if (entry.txHash) {
-      const status = await confirmed(entry.txHash);
-      if (status === "SUCCESS") return paid(digest, receipt(entry.txHash, req, undefined), undefined);
+    if (rec.txHash) {
+      const status = await confirmed(rec.txHash);
+      if (status === "SUCCESS") {
+        await store.delete(rec.digest);
+        return paidResult(receipt(rec.txHash, rec.requirements, undefined), undefined);
+      }
       if (status === "FAILED") {
-        pending.delete(digest);
+        await store.delete(rec.digest);
         return deny(price, resource, "settle_exact_stellar_transaction_failed", method);
       }
     }
-    const settle = await callFacilitator("/settle", payload, req, (v) => SettleResponseSchema.parse(v), entry.claimKey);
-    if (!settle.ok) return pend(digest, resource, req, entry.claimKey, entry.txHash);
-    return afterSettle(digest, settle.value, resource, req, entry.claimKey, price, method, undefined);
+    const call = await callFacilitator("/settle", payload, rec.requirements, (v) => SettleResponseSchema.parse(v), rec.claimKey);
+    return afterSettle(rec, call, resource, price, method, undefined);
   }
 
-  async function handleSerialized({ price, resource, headers, method: rawMethod }: HandleInput): Promise<HandleResult> {
+  async function handleLocked(digest: string, raw: string, { price, resource, method: rawMethod }: HandleInput): Promise<HandleResult> {
     const method = normalizeMethod(rawMethod ?? "GET");
-    const raw = headers.get(HEADER_PAYMENT_SIGNATURE) ?? headers.get(HEADER_PAYMENT_LEGACY);
-    if (!raw) return deny(price, resource, "payment_required", method);
-
     let payload: PaymentPayload;
     try {
       payload = PaymentPayloadSchema.parse(decodeHeader(raw));
@@ -355,15 +346,14 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     ) {
       return deny(price, resource, "accepted_terms_mismatch", method);
     }
-    // Method binding: a quote for GET carries no method; any other method is written into extra.method.
     const quotedMethod = normalizeMethod(typeof a.extra?.["method"] === "string" ? (a.extra["method"] as string) : "GET");
     if (quotedMethod !== method) return deny(price, resource, "resource_mismatch", method);
 
-    const digest = createHash("sha256").update(raw).digest("hex");
-    const entry = pending.get(digest);
-    if (entry) {
-      if (entry.resourceKey !== resourceKey(resource.url)) return deny(price, resource, "resource_mismatch", method);
-      return resumePending(digest, entry, payload, resource, price, method);
+    const rk = resourceKey(resource.url);
+    const existing = await store.get(digest);
+    if (existing) {
+      if (existing.resourceKey !== rk || existing.method !== method) return deny(price, resource, "resource_mismatch", method);
+      return resume(existing, payload, resource, price, method);
     }
 
     const verify = await callFacilitator("/verify", payload, expected, (v) => VerifyResponseSchema.parse(v));
@@ -371,37 +361,37 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     if (!verify.value.isValid) return deny(price, resource, verify.value.invalidReason ?? "payment_invalid", method);
 
     // Bind the payment to this resource: a header signed for /a is not money for /b.
-    if (!payload.resource || resourceKey(payload.resource.url) !== resourceKey(resource.url)) {
+    if (!payload.resource || resourceKey(payload.resource.url) !== rk) {
       return deny(price, resource, "resource_mismatch", method);
     }
 
-    const claimKey = randomUUID();
-    const settle = await callFacilitator("/settle", payload, expected, (v) => SettleResponseSchema.parse(v), claimKey);
-    if (!settle.ok) {
-      // The facilitator may have submitted before failing to answer: never re-quote as if unpaid.
-      return pend(digest, resource, expected, claimKey);
-    }
-    return afterSettle(digest, settle.value, resource, expected, claimKey, price, method, verify.value.payer);
+    // Write-ahead: the claim key is on disk (or in the shared store) before the facilitator can act on it.
+    const now = Date.now();
+    const rec: PendingRecord = {
+      digest,
+      resourceKey: rk,
+      method,
+      requirements: expected,
+      claimKey: randomUUID(),
+      state: "inflight",
+      createdAt: now,
+      expiresAt: now + expected.maxTimeoutSeconds * 2 * 1000 + graceMs,
+    };
+    await store.put(rec);
+    const call = await callFacilitator("/settle", payload, expected, (v) => SettleResponseSchema.parse(v), rec.claimKey);
+    return afterSettle(rec, call, resource, price, method, verify.value.payer);
   }
 
   return {
     config,
     requirements,
     paymentRequired,
-    /** Requests carrying the same payment are handled one at a time, so one payment can only ever deliver once. */
     async handle(input) {
+      const method = normalizeMethod(input.method ?? "GET");
       const raw = input.headers.get(HEADER_PAYMENT_SIGNATURE) ?? input.headers.get(HEADER_PAYMENT_LEGACY);
-      if (!raw) return handleSerialized(input);
+      if (!raw) return deny(input.price, input.resource, "payment_required", method);
       const digest = createHash("sha256").update(raw).digest("hex");
-      const previous = inFlight.get(digest) ?? Promise.resolve();
-      const run = previous.then(() => handleSerialized(input), () => handleSerialized(input));
-      const tracked = run.then(() => undefined, () => undefined);
-      inFlight.set(digest, tracked);
-      try {
-        return await run;
-      } finally {
-        if (inFlight.get(digest) === tracked) inFlight.delete(digest);
-      }
+      return store.withLock(digest, () => handleLocked(digest, raw, input));
     },
   };
 }
@@ -421,12 +411,21 @@ function normalizeMethod(m: string): string {
   return u || "GET";
 }
 
-function splitCredentials(url: string): { base: string; authorization?: string } {
+/**
+ * Credentials in the facilitator URL. `TOKEN@`, `:TOKEN@` and `bearer:TOKEN@`
+ * mean a bearer token (what SELLER_TOKENS expects); only an explicit
+ * `user:password` pair becomes Basic.
+ */
+export function splitCredentials(url: string): { base: string; authorization?: string } {
   const u = new URL(url);
   const base = `${u.origin}${u.pathname}`.replace(/\/$/, "");
-  if (!u.username && !u.password) return { base };
-  const creds = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
-  return { base, authorization: `Basic ${Buffer.from(creds, "utf8").toString("base64")}` };
+  const user = decodeURIComponent(u.username);
+  const pass = decodeURIComponent(u.password);
+  if (!user && !pass) return { base };
+  if (user && pass && user.toLowerCase() !== "bearer") {
+    return { base, authorization: `Basic ${Buffer.from(`${user}:${pass}`, "utf8").toString("base64")}` };
+  }
+  return { base, authorization: `Bearer ${pass || user}` };
 }
 
 /** Horizon inclusion check: 200 with `successful` decides; 404 or anything else is unknown. */
