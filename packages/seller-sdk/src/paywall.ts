@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   HEADER_PAYMENT_LEGACY,
   HEADER_PAYMENT_REQUIRED,
@@ -24,6 +24,7 @@ const DEFAULT_HORIZON: Readonly<Record<string, string>> = {
 };
 
 export type ChainStatus = "SUCCESS" | "FAILED" | "UNKNOWN";
+export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS";
 
 export interface PaywallConfig {
   /** Base URL of a Stellar x402 facilitator exposing /verify and /settle. Userinfo becomes an Authorization header. */
@@ -44,6 +45,12 @@ export interface PaywallConfig {
   confirm?: (hash: string) => Promise<ChainStatus>;
   confirmAttempts?: number;
   confirmDelayMs?: number;
+  /**
+   * Extra seconds a `settlement_pending` record stays alive after the
+   * payment's own validity (`maxTimeoutSeconds` for the envelope time bounds
+   * and again for the auth-entry expiry) has run out. Default 30.
+   */
+  pendingGraceSeconds?: number;
 }
 
 export interface HandleInput {
@@ -51,6 +58,8 @@ export interface HandleInput {
   price: string;
   resource: ResourceInfo;
   headers: Headers;
+  /** HTTP method of the request being paid for. Default GET. */
+  method?: string;
 }
 
 export interface SettlementPendingBody {
@@ -69,8 +78,9 @@ export type HandleResult =
 
 export interface Paywall {
   readonly config: Required<Pick<PaywallConfig, "facilitatorUrl" | "payTo" | "network" | "asset" | "maxTimeoutSeconds">>;
-  requirements(price: string): PaymentRequirements;
-  paymentRequired(price: string, resource: ResourceInfo, error?: string): PaymentRequired;
+  /** Terms for a price; `method` other than GET is written into `extra.method` so the payment is bound to it. */
+  requirements(price: string, method?: string): PaymentRequirements;
+  paymentRequired(price: string, resource: ResourceInfo, error?: string, method?: string): PaymentRequired;
   handle(input: HandleInput): Promise<HandleResult>;
 }
 
@@ -82,8 +92,11 @@ const MAX_PENDING = 1000;
 interface Pending {
   resourceKey: string;
   requirements: PaymentRequirements;
+  /** The claim identity this seller used on /settle; a retry re-uses it, so only this seller's claim can be read back. */
+  claimKey: string;
   txHash?: string;
-  at: number;
+  createdAt: number;
+  expiresAt: number;
 }
 
 /**
@@ -91,13 +104,20 @@ interface Pending {
  * PAYMENT-SIGNATURE is verified and settled through the facilitator before the
  * resource handler runs; the receipt is returned in PAYMENT-RESPONSE.
  *
- * Failure handling is designed so a buyer can never be charged twice:
- * - a payment is bound to the resource it quotes (`resource.url`), so a header
- *   signed for one route is refused on another;
- * - when settlement is ambiguous (facilitator 5xx after submit, confirmation
- *   poll failed) the buyer gets HTTP 409 `settlement_pending` with the same
- *   terms and must re-send the same header; the seller then checks the chain
- *   and delivers once the transaction is included;
+ * One payment buys exactly one delivery:
+ * - requests carrying the same header are processed one at a time; after the
+ *   first delivery every later one is refused by the facilitator (`nonce_reused`)
+ *   and the seller never delivers on that answer;
+ * - a payment is bound to method + origin + path of the resource it quoted;
+ * - when settlement is ambiguous (facilitator 5xx, confirmation lost) the buyer
+ *   gets HTTP 409 `settlement_pending` with the same terms; the seller keeps a
+ *   pending record (payment digest -> claim key, hash) and the buyer re-sends
+ *   the same header. The retry re-asks the facilitator **with the same claim
+ *   key**, so only this seller's own claim can turn into a delivery; two
+ *   concurrent retries yield one delivery;
+ * - a pending record expires once the envelope time bounds and the auth-entry
+ *   expiry have both passed with no inclusion; the next retry gets a terminal
+ *   402 with a fresh quote and the record is dropped;
  * - every error field is a fixed code; upstream text is never forwarded.
  */
 export function createPaywall(cfg: PaywallConfig): Paywall {
@@ -109,7 +129,9 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
   const confirmAttempts = cfg.confirmAttempts ?? 3;
   const confirmDelayMs = cfg.confirmDelayMs ?? 1500;
   const confirm = cfg.confirm ?? ((hash: string) => horizonStatus(fetchImpl, horizonUrl, hash));
+  const graceMs = (cfg.pendingGraceSeconds ?? 30) * 1000;
   const pending = new Map<string, Pending>();
+  const inFlight = new Map<string, Promise<unknown>>();
 
   const config = {
     facilitatorUrl,
@@ -119,25 +141,28 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     maxTimeoutSeconds: cfg.maxTimeoutSeconds ?? 60,
   };
 
-  const requirements = (price: string): PaymentRequirements => ({
-    scheme: "exact",
-    network: config.network,
-    asset: config.asset,
-    amount: usdToAtomic(price),
-    payTo: config.payTo,
-    maxTimeoutSeconds: config.maxTimeoutSeconds,
-    extra: { areFeesSponsored: true },
-  });
+  const requirements = (price: string, method = "GET"): PaymentRequirements => {
+    const m = normalizeMethod(method);
+    return {
+      scheme: "exact",
+      network: config.network,
+      asset: config.asset,
+      amount: usdToAtomic(price),
+      payTo: config.payTo,
+      maxTimeoutSeconds: config.maxTimeoutSeconds,
+      extra: { areFeesSponsored: true, ...(m === "GET" ? {} : { method: m }) },
+    };
+  };
 
-  const paymentRequired = (price: string, resource: ResourceInfo, error?: string): PaymentRequired => ({
+  const paymentRequired = (price: string, resource: ResourceInfo, error?: string, method = "GET"): PaymentRequired => ({
     x402Version: 2,
     ...(error ? { error } : {}),
     resource,
-    accepts: [requirements(price)],
+    accepts: [requirements(price, method)],
   });
 
-  const deny = (price: string, resource: ResourceInfo, error: string): HandleResult => {
-    const body = paymentRequired(price, resource, CODE.test(error) ? error : "payment_invalid");
+  const deny = (price: string, resource: ResourceInfo, error: string, method: string): HandleResult => {
+    const body = paymentRequired(price, resource, CODE.test(error) ? error : "payment_invalid", method);
     return {
       kind: "payment_required",
       status: 402,
@@ -146,12 +171,22 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     };
   };
 
-  const pend = (digest: string, resource: ResourceInfo, req: PaymentRequirements, txHash?: string): HandleResult => {
-    if (!pending.has(digest) && pending.size >= MAX_PENDING) {
+  const pend = (digest: string, resource: ResourceInfo, req: PaymentRequirements, claimKey: string, txHash?: string): HandleResult => {
+    const existing = pending.get(digest);
+    if (!existing && pending.size >= MAX_PENDING) {
       const oldest = pending.keys().next().value;
       if (oldest) pending.delete(oldest);
     }
-    pending.set(digest, { resourceKey: resourceKey(resource.url), requirements: req, at: Date.now(), ...(txHash ? { txHash } : {}) });
+    const now = Date.now();
+    const ttlMs = req.maxTimeoutSeconds * 2 * 1000 + graceMs;
+    pending.set(digest, {
+      resourceKey: resourceKey(resource.url),
+      requirements: req,
+      claimKey,
+      createdAt: existing?.createdAt ?? now,
+      expiresAt: existing?.expiresAt ?? now + ttlMs,
+      ...(txHash ? { txHash } : existing?.txHash ? { txHash: existing.txHash } : {}),
+    });
     const body: SettlementPendingBody = {
       x402Version: 2,
       error: "settlement_pending",
@@ -178,12 +213,17 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     paymentPayload: PaymentPayload,
     paymentRequirements: PaymentRequirements,
     parse: (v: unknown) => T,
+    claimKey?: string,
   ): Promise<{ ok: true; value: T } | { ok: false; code: "facilitator_unreachable" | "facilitator_error" }> {
     let res: Response;
     try {
       res = await fetchImpl(`${facilitatorUrl}${path}`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...(authorization ? { authorization } : {}) },
+        headers: {
+          "content-type": "application/json",
+          ...(authorization ? { authorization } : {}),
+          ...(claimKey ? { "idempotency-key": claimKey } : {}),
+        },
         body: JSON.stringify({ x402Version: 2, paymentPayload, paymentRequirements }),
       });
     } catch {
@@ -219,96 +259,149 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     amount: req.amount,
   });
 
-  /** A pending settlement is re-checked on retry: chain first if we know the hash, else the facilitator. */
+  /** Outcome of a /settle answer that is not a clean success; `hash` is whatever we know. */
+  async function afterSettle(
+    digest: string,
+    settle: SettleResponse,
+    resource: ResourceInfo,
+    req: PaymentRequirements,
+    claimKey: string,
+    price: string,
+    method: string,
+    payer: string | undefined,
+  ): Promise<HandleResult> {
+    if (settle.success) return paid(digest, settle, settle.payer ?? payer);
+    const reason = settle.errorReason ?? "settlement_failed";
+    // Someone else's claim. Never a delivery, whatever the chain says.
+    if (reason === "invalid_exact_stellar_payload_nonce_reused") {
+      pending.delete(digest);
+      return deny(price, resource, reason, method);
+    }
+    // The facilitator read the ledger and saw the envelope fail: definitive.
+    if (reason === "settle_exact_stellar_transaction_failed") {
+      pending.delete(digest);
+      return deny(price, resource, reason, method);
+    }
+    const hash = settle.transaction || undefined;
+    if (!hash) {
+      // Nothing was submitted under our claim (e.g. submission refused): the entry is unspent; quote again.
+      if (reason === "settle_exact_stellar_transaction_submission_failed" || reason === "nonce_store_unavailable") {
+        pending.delete(digest);
+        return deny(price, resource, reason, method);
+      }
+      return pend(digest, resource, req, claimKey);
+    }
+    const status = await confirmed(hash);
+    if (status === "SUCCESS") return paid(digest, receipt(hash, req, settle.payer ?? payer), settle.payer ?? payer);
+    if (status === "FAILED") {
+      pending.delete(digest);
+      return deny(price, resource, "settle_exact_stellar_transaction_failed", method);
+    }
+    return pend(digest, resource, req, claimKey, hash);
+  }
+
+  /** A pending settlement retried with the same header: our own claim, re-asked with our own claim key. */
   async function resumePending(
     digest: string,
     entry: Pending,
     payload: PaymentPayload,
     resource: ResourceInfo,
+    price: string,
+    method: string,
   ): Promise<HandleResult> {
     const req = entry.requirements;
-    let hash = entry.txHash;
-    let payer: string | undefined;
-    if (!hash) {
-      const settle = await callFacilitator("/settle", payload, req, (v) => SettleResponseSchema.parse(v));
-      if (!settle.ok) return pend(digest, resource, req);
-      if (settle.value.success) return paid(digest, settle.value, settle.value.payer);
-      payer = settle.value.payer;
-      hash = settle.value.transaction || undefined;
-      if (!hash) {
+    if (Date.now() >= entry.expiresAt) {
+      // Envelope time bounds and auth expiry have passed. One last look at the chain, then terminal.
+      if (entry.txHash) {
+        const status = await confirmed(entry.txHash);
+        if (status === "SUCCESS") return paid(digest, receipt(entry.txHash, req, undefined), undefined);
+      }
+      pending.delete(digest);
+      return deny(price, resource, "settlement_expired", method);
+    }
+    if (entry.txHash) {
+      const status = await confirmed(entry.txHash);
+      if (status === "SUCCESS") return paid(digest, receipt(entry.txHash, req, undefined), undefined);
+      if (status === "FAILED") {
         pending.delete(digest);
-        return deny(usdFromAtomic(req.amount), resource, settle.value.errorReason ?? "settlement_failed");
+        return deny(price, resource, "settle_exact_stellar_transaction_failed", method);
       }
     }
-    const status = await confirmed(hash);
-    if (status === "SUCCESS") return paid(digest, receipt(hash, req, payer), payer);
-    if (status === "FAILED") {
-      pending.delete(digest);
-      return deny(usdFromAtomic(req.amount), resource, "settle_exact_stellar_transaction_failed");
+    const settle = await callFacilitator("/settle", payload, req, (v) => SettleResponseSchema.parse(v), entry.claimKey);
+    if (!settle.ok) return pend(digest, resource, req, entry.claimKey, entry.txHash);
+    return afterSettle(digest, settle.value, resource, req, entry.claimKey, price, method, undefined);
+  }
+
+  async function handleSerialized({ price, resource, headers, method: rawMethod }: HandleInput): Promise<HandleResult> {
+    const method = normalizeMethod(rawMethod ?? "GET");
+    const raw = headers.get(HEADER_PAYMENT_SIGNATURE) ?? headers.get(HEADER_PAYMENT_LEGACY);
+    if (!raw) return deny(price, resource, "payment_required", method);
+
+    let payload: PaymentPayload;
+    try {
+      payload = PaymentPayloadSchema.parse(decodeHeader(raw));
+    } catch {
+      return deny(price, resource, "payment_signature_malformed", method);
     }
-    return pend(digest, resource, req, hash);
+
+    const expected = requirements(price, method);
+    const a = payload.accepted;
+    if (
+      a.scheme !== expected.scheme ||
+      a.network !== expected.network ||
+      a.asset !== expected.asset ||
+      a.amount !== expected.amount ||
+      a.payTo !== expected.payTo
+    ) {
+      return deny(price, resource, "accepted_terms_mismatch", method);
+    }
+    // Method binding: a quote for GET carries no method; any other method is written into extra.method.
+    const quotedMethod = normalizeMethod(typeof a.extra?.["method"] === "string" ? (a.extra["method"] as string) : "GET");
+    if (quotedMethod !== method) return deny(price, resource, "resource_mismatch", method);
+
+    const digest = createHash("sha256").update(raw).digest("hex");
+    const entry = pending.get(digest);
+    if (entry) {
+      if (entry.resourceKey !== resourceKey(resource.url)) return deny(price, resource, "resource_mismatch", method);
+      return resumePending(digest, entry, payload, resource, price, method);
+    }
+
+    const verify = await callFacilitator("/verify", payload, expected, (v) => VerifyResponseSchema.parse(v));
+    if (!verify.ok) return deny(price, resource, verify.code, method);
+    if (!verify.value.isValid) return deny(price, resource, verify.value.invalidReason ?? "payment_invalid", method);
+
+    // Bind the payment to this resource: a header signed for /a is not money for /b.
+    if (!payload.resource || resourceKey(payload.resource.url) !== resourceKey(resource.url)) {
+      return deny(price, resource, "resource_mismatch", method);
+    }
+
+    const claimKey = randomUUID();
+    const settle = await callFacilitator("/settle", payload, expected, (v) => SettleResponseSchema.parse(v), claimKey);
+    if (!settle.ok) {
+      // The facilitator may have submitted before failing to answer: never re-quote as if unpaid.
+      return pend(digest, resource, expected, claimKey);
+    }
+    return afterSettle(digest, settle.value, resource, expected, claimKey, price, method, verify.value.payer);
   }
 
   return {
     config,
     requirements,
     paymentRequired,
-    async handle({ price, resource, headers }) {
-      const raw = headers.get(HEADER_PAYMENT_SIGNATURE) ?? headers.get(HEADER_PAYMENT_LEGACY);
-      if (!raw) return deny(price, resource, "payment_required");
-
-      let payload: PaymentPayload;
-      try {
-        payload = PaymentPayloadSchema.parse(decodeHeader(raw));
-      } catch {
-        return deny(price, resource, "payment_signature_malformed");
-      }
-
-      const expected = requirements(price);
-      const a = payload.accepted;
-      if (
-        a.scheme !== expected.scheme ||
-        a.network !== expected.network ||
-        a.asset !== expected.asset ||
-        a.amount !== expected.amount ||
-        a.payTo !== expected.payTo
-      ) {
-        return deny(price, resource, "accepted_terms_mismatch");
-      }
-
+    /** Requests carrying the same payment are handled one at a time, so one payment can only ever deliver once. */
+    async handle(input) {
+      const raw = input.headers.get(HEADER_PAYMENT_SIGNATURE) ?? input.headers.get(HEADER_PAYMENT_LEGACY);
+      if (!raw) return handleSerialized(input);
       const digest = createHash("sha256").update(raw).digest("hex");
-      const entry = pending.get(digest);
-      if (entry) {
-        if (entry.resourceKey !== resourceKey(resource.url)) return deny(price, resource, "resource_mismatch");
-        return resumePending(digest, entry, payload, resource);
+      const previous = inFlight.get(digest) ?? Promise.resolve();
+      const run = previous.then(() => handleSerialized(input), () => handleSerialized(input));
+      const tracked = run.then(() => undefined, () => undefined);
+      inFlight.set(digest, tracked);
+      try {
+        return await run;
+      } finally {
+        if (inFlight.get(digest) === tracked) inFlight.delete(digest);
       }
-
-      const verify = await callFacilitator("/verify", payload, expected, (v) => VerifyResponseSchema.parse(v));
-      if (!verify.ok) return deny(price, resource, verify.code);
-      if (!verify.value.isValid) return deny(price, resource, verify.value.invalidReason ?? "payment_invalid");
-
-      // Bind the payment to this resource: a header signed for /a is not money for /b.
-      if (!payload.resource || resourceKey(payload.resource.url) !== resourceKey(resource.url)) {
-        return deny(price, resource, "resource_mismatch");
-      }
-
-      const settle = await callFacilitator("/settle", payload, expected, (v) => SettleResponseSchema.parse(v));
-      if (!settle.ok) {
-        // The facilitator may have submitted before failing to answer: never re-quote as if unpaid.
-        return pend(digest, resource, expected);
-      }
-      if (settle.value.success) return paid(digest, settle.value, settle.value.payer ?? verify.value.payer);
-
-      // A FAILED verdict from the facilitator is definitive (it read the ledger); anything else with a hash is ambiguous.
-      const hash = settle.value.transaction;
-      if (hash && settle.value.errorReason !== "settle_exact_stellar_transaction_failed") {
-        const status = await confirmed(hash);
-        if (status === "SUCCESS") {
-          return paid(digest, receipt(hash, expected, settle.value.payer ?? verify.value.payer), settle.value.payer);
-        }
-        if (status === "UNKNOWN") return pend(digest, resource, expected, hash);
-      }
-      return deny(price, resource, settle.value.errorReason ?? "settlement_failed");
     },
   };
 }
@@ -323,17 +416,17 @@ export function resourceKey(url: string): string {
   }
 }
 
+function normalizeMethod(m: string): string {
+  const u = m.trim().toUpperCase();
+  return u || "GET";
+}
+
 function splitCredentials(url: string): { base: string; authorization?: string } {
   const u = new URL(url);
   const base = `${u.origin}${u.pathname}`.replace(/\/$/, "");
   if (!u.username && !u.password) return { base };
   const creds = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
   return { base, authorization: `Basic ${Buffer.from(creds, "utf8").toString("base64")}` };
-}
-
-function usdFromAtomic(amount: string): string {
-  const padded = amount.padStart(8, "0");
-  return `${padded.slice(0, -7)}.${padded.slice(-7)}`.replace(/\.?0+$/, "") || "0";
 }
 
 /** Horizon inclusion check: 200 with `successful` decides; 404 or anything else is unknown. */

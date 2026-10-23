@@ -30,6 +30,7 @@ export function honoPaywall(paywall: Paywall, opts: HonoPaywallOptions): Middlew
         mimeType: opts.mimeType ?? "application/json",
       },
       headers: c.req.raw.headers,
+      method: c.req.method,
     });
     if (result.kind === "payment_required") {
       return c.json(result.body, 402, result.headers);
