@@ -1,0 +1,5 @@
+target/
+*.wasm
+deploy-keys*.json
+.stellar/
+test_snapshots/
