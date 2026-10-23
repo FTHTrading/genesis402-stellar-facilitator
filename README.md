@@ -16,7 +16,7 @@ Apache-2.0. Copyright 2026 UnyKorn LLC (Wyoming). Contact: kevan@unykorn.org.
 | Reference seller (two paid routes + manifest) and payer demo | `examples/` | **REAL on testnet** when run with `npm run demo:testnet` |
 | Payment asset in the demo | `TUSDC`, issued per run by a throwaway testnet issuer | **DEMO**. Not USDC, no value. Circle's testnet USDC works unchanged if the payer holds some (see below) |
 | Stellar mainnet (`stellar:pubnet`) | constants only | **NOT DEPLOYED**, out of scope for T1 |
-| Soroban settlement contract `x402-settle` (payer-authorized `settle`, on-chain nonce with a readable `Settlement { seller, token, amount, ledger }` record, exact amount payer to seller, no fee logic, admin-less) | `contracts/x402-settle` on branch `t2/rebase-main` (not on `main` at this commit) | **TESTED on testnet** at `CDWAJIUNSSVZFLN5FIJ3IHFHABILGEVGNYPYQMQLHFLET7JVJPXLPTHD` (see `contracts/x402-settle/DEPLOY-TESTNET.md`); **NOT DEPLOYED to mainnet**; **not yet wired to the facilitator** (`/settle` still transfers through the token contract directly; the switch is designed in `docs/T2-contract-path.md`) |
+| Soroban settlement contract `x402-settle` (payer-authorized `settle`, on-chain nonce with a readable `Settlement { seller, token, amount, ledger }` record, exact amount payer to seller, no fee logic, admin-less) | `contracts/x402-settle` on `main` | **TESTED on testnet** at `CDWAJIUNSSVZFLN5FIJ3IHFHABILGEVGNYPYQMQLHFLET7JVJPXLPTHD` (see `contracts/x402-settle/DEPLOY-TESTNET.md`); **NOT DEPLOYED to mainnet**; **not yet wired to the facilitator** (`/settle` still transfers through the token contract directly; the switch is designed in `docs/T2-contract-path.md`) |
 
 ## Run it in 5 minutes
 
