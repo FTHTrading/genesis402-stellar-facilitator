@@ -50,7 +50,11 @@ export interface RpcChainClientOptions {
   network: string;
   rpcUrl?: string;
   horizonUrl?: string;
+  /** Per-request timeout for RPC and Horizon calls (ms). Default 20 s; a hung node must not hold a settlement. */
+  timeoutMs?: number;
 }
+
+export const DEFAULT_RPC_TIMEOUT_MS = 20_000;
 
 /** Turns one diagnostic event into a TransferEvent when it is a SEP-41 transfer; otherwise undefined. */
 export function parseTransferEvent(ev: xdr.DiagnosticEvent): TransferEvent | undefined {
@@ -102,8 +106,10 @@ export class RpcChainClient implements ChainClient {
     if (!rpcUrl) throw new Error(`No Soroban RPC URL for ${opts.network}; set STELLAR_RPC_URL`);
     const horizonUrl = opts.horizonUrl ?? DEFAULT_HORIZON_URLS[opts.network];
     if (!horizonUrl) throw new Error(`No Horizon URL for ${opts.network}; set STELLAR_HORIZON_URL`);
-    this.server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://") });
+    const timeout = opts.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+    this.server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://"), timeout });
     this.horizon = new Horizon.Server(horizonUrl, { allowHttp: horizonUrl.startsWith("http://") });
+    this.horizon.httpClient.defaults.timeout = timeout;
   }
 
   async getLatestLedger(): Promise<number> {

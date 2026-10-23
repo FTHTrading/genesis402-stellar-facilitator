@@ -1,4 +1,11 @@
-import { Keypair, Operation, Transaction, TransactionBuilder, type Account } from "@stellar/stellar-sdk";
+import {
+  Keypair,
+  Operation,
+  StrKey,
+  Transaction,
+  TransactionBuilder,
+  type Account,
+} from "@stellar/stellar-sdk";
 import type { ChainClient, TransferEvent } from "./chain.js";
 import {
   DEFAULT_INCLUSION_FEE_STROOPS,
@@ -20,6 +27,11 @@ import type {
 } from "./types.js";
 import { verifyStatic, type StaticResult } from "./verify.js";
 
+/** Upper bound on the time one settlement may hold the signer. Past it the lock is released and the result reported as ambiguous. */
+export const DEFAULT_SETTLE_DEADLINE_MS = 12_000;
+/** How long an idempotent re-read waits for a still-pending transaction before answering `not_confirmed`. */
+const REREAD_CONFIRM_SECONDS = 5;
+
 export interface FacilitatorOptions {
   /** CAIP-2 network this instance settles on, e.g. `stellar:testnet`. */
   network: string;
@@ -29,20 +41,58 @@ export interface FacilitatorOptions {
   nonceStore: NonceStore;
   /**
    * Token contracts this facilitator will sponsor. Default: Circle USDC on the
-   * network. Anything else is refused at verify (`asset_not_allowed`).
+   * network. Anything else is refused at verify (`asset_not_allowed`). Every
+   * entry must be a valid contract strkey; the constructor fails closed otherwise.
    */
   allowedAssets?: readonly string[];
   /** Safety ceiling for the simulation-derived fee (stroops). Default 50,000. */
   maxTransactionFeeStroops?: number;
   /** Inclusion fee bid on top of the resource fee (stroops). Default 100. */
   inclusionFeeStroops?: number;
+  /** Wall-clock cap on the locked part of a settlement. Default 12 s. */
+  settleDeadlineMs?: number;
+  /**
+   * Fee-drain guard (threat model DoS.6): a hosted facilitator pays fees for
+   * anyone, so valid dust payments to an attacker's own seller drain the fee
+   * account. Settlement fees charged in the trailing hour may not exceed this
+   * budget. Default 5,000,000 stroops (0.5 XLM).
+   */
+  feeBudgetStroopsPerHour?: number;
+  /** Settlements accepted per `payTo` in the trailing hour. Default 600. */
+  maxSettlesPerSellerPerHour?: number;
+  now?: () => number;
   /** Server-side logger for causes that are never sent to clients. */
   log?: (message: string, err?: unknown) => void;
 }
 
+export interface SettleOptions {
+  /**
+   * Opaque claimant identity (the seller's idempotency key for this payment).
+   * A later /settle with the same key for the same entry gets the recorded
+   * outcome back; any other key gets `nonce_reused`.
+   */
+  claimKey?: string;
+}
+
 type Static = Extract<StaticResult, { ok: true }>;
 type Invalid = { ok: false; reason: string; payer?: string; nonce?: string };
-type Prepared = { ok: true; rebuilt: Transaction; assemble: (tx: Transaction) => Transaction };
+type Prepared = { ok: true; rebuilt: Transaction; assemble: (tx: Transaction) => Transaction; feeStroops: number };
+
+const HOUR_MS = 3_600_000;
+
+/** Sliding one-hour window of (timestamp, weight) entries. */
+class HourWindow {
+  private entries: Array<{ at: number; w: number }> = [];
+  constructor(private readonly now: () => number) {}
+  total(): number {
+    const cutoff = this.now() - HOUR_MS;
+    this.entries = this.entries.filter((e) => e.at > cutoff);
+    return this.entries.reduce((s, e) => s + e.w, 0);
+  }
+  add(w: number): void {
+    this.entries.push({ at: this.now(), w });
+  }
+}
 
 /** Promise-chain mutex: one settlement at a time per facilitator account. */
 class Mutex {
@@ -62,9 +112,10 @@ class Mutex {
  * contract; the facilitator is never `from`, `to`, or an auth signer.
  *
  * Settlements are serialized per facilitator account (one Stellar account has
- * one sequence number; a second envelope at the same sequence is not admitted).
- * Throughput is therefore one settlement per ledger per signer; channel
- * accounts are the T2 answer.
+ * one sequence number; a second envelope at the same sequence is not admitted),
+ * and the locked section is bounded by `settleDeadlineMs` so one stalled RPC
+ * call cannot stop every other buyer. Channel accounts are the T2 answer to
+ * throughput.
  */
 export class StellarFacilitator {
   readonly network: string;
@@ -74,6 +125,12 @@ export class StellarFacilitator {
   readonly allowedAssets: ReadonlySet<string>;
   readonly maxTransactionFeeStroops: number;
   readonly inclusionFeeStroops: number;
+  readonly settleDeadlineMs: number;
+  readonly feeBudgetStroopsPerHour: number;
+  readonly maxSettlesPerSellerPerHour: number;
+  private readonly feeWindow: HourWindow;
+  private readonly sellerWindows = new Map<string, HourWindow>();
+  private readonly now: () => number;
   private readonly chain: ChainClient;
   private readonly nonces: NonceStore;
   private readonly facilitatorAddresses: ReadonlySet<string>;
@@ -89,11 +146,19 @@ export class StellarFacilitator {
     this.chain = opts.chain;
     this.nonces = opts.nonceStore;
     const defaults = USDC_SAC[opts.network];
-    const allowed = opts.allowedAssets ?? (defaults ? [defaults] : []);
+    const allowed = (opts.allowedAssets ?? (defaults ? [defaults] : [])).map((a) => a.trim()).filter(Boolean);
     if (allowed.length === 0) throw new Error("allowedAssets must name at least one token contract");
+    for (const a of allowed) {
+      if (!StrKey.isValidContract(a)) throw new Error(`allowedAssets entry is not a contract strkey: ${a}`);
+    }
     this.allowedAssets = new Set(allowed);
     this.maxTransactionFeeStroops = opts.maxTransactionFeeStroops ?? DEFAULT_MAX_TRANSACTION_FEE_STROOPS;
     this.inclusionFeeStroops = opts.inclusionFeeStroops ?? DEFAULT_INCLUSION_FEE_STROOPS;
+    this.settleDeadlineMs = opts.settleDeadlineMs ?? DEFAULT_SETTLE_DEADLINE_MS;
+    this.feeBudgetStroopsPerHour = opts.feeBudgetStroopsPerHour ?? 5_000_000;
+    this.maxSettlesPerSellerPerHour = opts.maxSettlesPerSellerPerHour ?? 600;
+    this.now = opts.now ?? (() => Date.now());
+    this.feeWindow = new HourWindow(this.now);
     this.facilitatorAddresses = new Set([this.address]);
     this.log = opts.log ?? ((m, e) => console.error(`[facilitator] ${m}`, e ?? ""));
   }
@@ -121,8 +186,13 @@ export class StellarFacilitator {
     return { isValid: true, payer: s.payer };
   }
 
-  async settle(payload: PaymentPayload, requirements: PaymentRequirements): Promise<SettleResponse> {
+  async settle(
+    payload: PaymentPayload,
+    requirements: PaymentRequirements,
+    options: SettleOptions = {},
+  ): Promise<SettleResponse> {
     const network = payload.accepted?.network ?? requirements.network;
+    const claimKey = options.claimKey ?? "";
     const failed = (errorReason: string, payer?: string, transaction = ""): SettleResponse => ({
       success: false,
       errorReason,
@@ -133,21 +203,59 @@ export class StellarFacilitator {
 
     const s = await this.check(payload, requirements);
     if (!s.ok) {
-      // A replay names the transaction that consumed the entry so the seller can confirm it on chain.
-      let recorded = "";
       if (s.reason === "invalid_exact_stellar_payload_nonce_reused" && s.payer && s.nonce) {
-        try {
-          recorded = this.nonces.lookup(this.network, s.payer, s.nonce) ?? "";
-        } catch {
-          recorded = "";
-        }
+        return this.reread(s.payer, s.nonce, claimKey, network, requirements);
       }
-      return failed(s.reason, s.payer, recorded);
+      return failed(s.reason, s.payer);
     }
 
-    return this.lock.run(async () => {
+    return this.lock.run(() => this.critical(s, requirements, claimKey, network, failed));
+  }
+
+  /**
+   * The locked part: rebuild, simulate, claim, submit, confirm. Bounded by the
+   * deadline; when it fires the lock is released and the outcome reported from
+   * how far the section got. A claim made before the deadline is kept (the
+   * envelope may have reached a node); a section that never claimed leaves the
+   * buyer's entry untouched.
+   */
+  private async critical(
+    s: Static,
+    requirements: PaymentRequirements,
+    claimKey: string,
+    network: string,
+    failed: (reason: string, payer?: string, transaction?: string) => SettleResponse,
+  ): Promise<SettleResponse> {
+    const state = { phase: "preparing" as "preparing" | "claimed" | "submitted" | "done", hash: "", aborted: false };
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<SettleResponse>((resolve) => {
+      timer = setTimeout(() => {
+        state.aborted = true;
+        this.log(`settle deadline (${this.settleDeadlineMs} ms) hit in phase ${state.phase} for ${s.payer}`);
+        if (state.phase === "submitted") {
+          resolve(failed("settle_exact_stellar_transaction_not_confirmed", s.payer, state.hash));
+        } else if (state.phase === "claimed") {
+          resolve(failed("unexpected_settle_error", s.payer, state.hash));
+        } else {
+          resolve(failed("unexpected_settle_error", s.payer));
+        }
+      }, this.settleDeadlineMs);
+    });
+    const body = (async (): Promise<SettleResponse> => {
       const p = await this.prepare(s, requirements);
       if (!p.ok) return failed(p.reason, s.payer);
+      if (state.aborted) return failed("unexpected_settle_error", s.payer);
+
+      // Fee-drain guard: the hour's fee budget and the seller's hourly count, checked before any claim.
+      if (this.feeWindow.total() + p.feeStroops > this.feeBudgetStroopsPerHour) {
+        this.log(`fee budget exhausted: ${this.feeWindow.total()} + ${p.feeStroops} > ${this.feeBudgetStroopsPerHour}`);
+        return failed("fee_budget_exhausted", s.payer);
+      }
+      const sellerWindow = this.sellerWindow(requirements.payTo);
+      if (sellerWindow.total() + 1 > this.maxSettlesPerSellerPerHour) {
+        this.log(`seller cap reached for ${requirements.payTo}`);
+        return failed("seller_rate_limited", s.payer);
+      }
 
       let tx: Transaction;
       let hash: string;
@@ -163,12 +271,19 @@ export class StellarFacilitator {
       // Claim the nonce right before submission; a concurrent settle of the same payload loses this race.
       let claimed: boolean;
       try {
-        claimed = this.nonces.consume(this.network, s.payer, s.nonce, hash);
+        claimed = this.nonces.consume(this.network, s.payer, s.nonce, hash, claimKey);
       } catch (err) {
         this.log("nonce store unavailable at claim", err);
         return failed("nonce_store_unavailable", s.payer);
       }
-      if (!claimed) return failed("invalid_exact_stellar_payload_nonce_reused", s.payer, this.safeLookup(s));
+      if (!claimed) return this.reread(s.payer, s.nonce, claimKey, network, requirements);
+      state.phase = "claimed";
+      state.hash = hash;
+      if (state.aborted) {
+        // Deadline fired between claim and send: nothing was submitted, so the entry is unspent.
+        this.safeRelease(s);
+        return failed("unexpected_settle_error", s.payer);
+      }
 
       let sent: { status: string; hash: string; error?: string };
       try {
@@ -176,17 +291,22 @@ export class StellarFacilitator {
       } catch (err) {
         // Ambiguous: the envelope may have reached a node. Keep the claim; report the hash for reconciliation.
         this.log(`sendTransaction threw for ${hash}`, err);
+        this.safeStatus(s, "submitted");
         return failed("unexpected_settle_error", s.payer, hash);
       }
       if (sent.status !== "PENDING") {
         // ERROR and TRY_AGAIN_LATER mean the network did not admit this envelope: the entry is unspent.
-        if (sent.status === "ERROR" || sent.status === "TRY_AGAIN_LATER") {
-          this.safeRelease(s);
-        }
+        if (sent.status === "ERROR" || sent.status === "TRY_AGAIN_LATER") this.safeRelease(s);
         this.log(`sendTransaction ${sent.status} for ${hash}: ${sent.error ?? ""}`);
         return failed("settle_exact_stellar_transaction_submission_failed", s.payer);
       }
       hash = sent.hash;
+      state.phase = "submitted";
+      state.hash = hash;
+      this.safeStatus(s, "submitted", hash);
+      // The fee is spent once the network admits the envelope, whatever happens afterwards.
+      this.feeWindow.add(p.feeStroops);
+      sellerWindow.add(1);
 
       let final: { status: string };
       try {
@@ -196,22 +316,78 @@ export class StellarFacilitator {
         return failed("settle_exact_stellar_transaction_not_confirmed", s.payer, hash);
       }
       if (final.status === "SUCCESS") {
+        this.safeStatus(s, "confirmed");
         return { success: true, transaction: hash, network, payer: s.payer, amount: requirements.amount };
       }
-      return failed(
-        final.status === "FAILED"
-          ? "settle_exact_stellar_transaction_failed"
-          : "settle_exact_stellar_transaction_not_confirmed",
-        s.payer,
-        hash,
-      );
-    });
+      if (final.status === "FAILED") {
+        this.safeStatus(s, "failed");
+        return failed("settle_exact_stellar_transaction_failed", s.payer, hash);
+      }
+      return failed("settle_exact_stellar_transaction_not_confirmed", s.payer, hash);
+    })();
+    try {
+      return await Promise.race([body, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      state.phase = "done";
+      body.catch(() => undefined);
+    }
+  }
+
+  /**
+   * The entry is already claimed. The claimant that made the claim (same
+   * `claimKey`) may read its outcome again; everyone else is told the entry is
+   * spent, with the paying transaction so a seller can check the chain.
+   * Delivery is never granted here to a different claimant.
+   */
+  private async reread(
+    payer: string,
+    nonce: string,
+    claimKey: string,
+    network: string,
+    requirements: PaymentRequirements,
+  ): Promise<SettleResponse> {
+    let rec;
+    try {
+      rec = this.nonces.lookup(this.network, payer, nonce);
+    } catch {
+      rec = undefined;
+    }
+    const refused: SettleResponse = {
+      success: false,
+      errorReason: "invalid_exact_stellar_payload_nonce_reused",
+      transaction: rec?.txHash ?? "",
+      network,
+      payer,
+    };
+    if (!rec || !claimKey || rec.claimKey !== claimKey) return refused;
+    if (rec.status === "confirmed") {
+      return { success: true, transaction: rec.txHash, network, payer, amount: requirements.amount };
+    }
+    if (rec.status === "failed") {
+      return { success: false, errorReason: "settle_exact_stellar_transaction_failed", transaction: rec.txHash, network, payer };
+    }
+    // claimed or submitted: the original section may still be running or may have lost its answer. Look once more.
+    try {
+      const final = await this.chain.waitForTransaction(rec.txHash, REREAD_CONFIRM_SECONDS);
+      if (final.status === "SUCCESS") {
+        this.safeSetStatus(payer, nonce, "confirmed");
+        return { success: true, transaction: rec.txHash, network, payer, amount: requirements.amount };
+      }
+      if (final.status === "FAILED") {
+        this.safeSetStatus(payer, nonce, "failed");
+        return { success: false, errorReason: "settle_exact_stellar_transaction_failed", transaction: rec.txHash, network, payer };
+      }
+    } catch (err) {
+      this.log(`re-read confirmation failed for ${rec.txHash}`, err);
+    }
+    return { success: false, errorReason: "settle_exact_stellar_transaction_not_confirmed", transaction: rec.txHash, network, payer };
   }
 
   /** Allowlist, ledger height, and every network-free check. */
   private async check(payload: PaymentPayload, requirements: PaymentRequirements): Promise<Static | Invalid> {
     if (requirements.network !== this.network) return { ok: false, reason: "invalid_network" };
-    if (!this.allowedAssets.has(requirements.asset)) {
+    if (!this.allowedAssets.has(requirements.asset) || payload.accepted?.asset !== requirements.asset) {
       return { ok: false, reason: "invalid_exact_stellar_payload_asset_not_allowed" };
     }
     let currentLedger: number;
@@ -285,15 +461,22 @@ export class StellarFacilitator {
     }
     const eventError = checkTransfers(sim.transfers, expected);
     if (eventError) return { ok: false, reason: eventError, payer: s.payer };
-    return { ok: true, rebuilt, assemble: sim.assemble };
+    return { ok: true, rebuilt, assemble: sim.assemble, feeStroops: settlementFee };
   }
 
-  private safeLookup(s: Static): string {
-    try {
-      return this.nonces.lookup(this.network, s.payer, s.nonce) ?? "";
-    } catch {
-      return "";
+  /** Fees charged in the trailing hour (stroops) and settlements per seller; exposed for /health. */
+  usage(): { feeStroopsLastHour: number; feeBudgetStroopsPerHour: number } {
+    return { feeStroopsLastHour: this.feeWindow.total(), feeBudgetStroopsPerHour: this.feeBudgetStroopsPerHour };
+  }
+
+  private sellerWindow(payTo: string): HourWindow {
+    let w = this.sellerWindows.get(payTo);
+    if (!w) {
+      if (this.sellerWindows.size > 10_000) this.sellerWindows.delete(this.sellerWindows.keys().next().value!);
+      w = new HourWindow(this.now);
+      this.sellerWindows.set(payTo, w);
     }
+    return w;
   }
 
   private safeRelease(s: Static): void {
@@ -301,6 +484,18 @@ export class StellarFacilitator {
       this.nonces.release(this.network, s.payer, s.nonce);
     } catch (err) {
       this.log("nonce release failed", err);
+    }
+  }
+
+  private safeStatus(s: Static, status: "submitted" | "confirmed" | "failed", hash?: string): void {
+    this.safeSetStatus(s.payer, s.nonce, status, hash);
+  }
+
+  private safeSetStatus(payer: string, nonce: string, status: "submitted" | "confirmed" | "failed", hash?: string): void {
+    try {
+      this.nonces.setStatus(this.network, payer, nonce, status, hash);
+    } catch (err) {
+      this.log("nonce status update failed", err);
     }
   }
 }
