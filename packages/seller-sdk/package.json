@@ -1,0 +1,10 @@
+{
+  "name": "@genesis402/stellar-seller-sdk",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "dependencies": { "zod": "^4.6.7" }
+}

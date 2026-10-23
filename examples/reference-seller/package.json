@@ -1,0 +1,2 @@
+{ "name": "@genesis402/example-reference-seller", "version": "0.1.0", "private": true, "license": "Apache-2.0", "type": "module",
+  "dependencies": { "@genesis402/stellar-seller-sdk": "0.1.0", "@hono/node-server": "^2.1.5", "hono": "^4.13.13" } }
