@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { InMemoryPendingStore, PendingStoreBusyError, type PendingRecord, type PendingStore } from "./pending-store.js";
+import { InMemoryPendingStore, PendingStoreBusyError, isStoreBusyError, type LeaseHandle, type PendingRecord, type PendingStore } from "./pending-store.js";
 import {
   HEADER_PAYMENT_LEGACY,
   HEADER_PAYMENT_REQUIRED,
@@ -54,6 +54,14 @@ export interface PaywallConfig {
   confirmDelayMs?: number;
   /** Upper bound for one inclusion check, so a slow Horizon cannot hold a payment's lock. Default 5 s. */
   confirmTimeoutMs?: number;
+  /**
+   * Upper bound for one facilitator HTTP call (/verify, /settle). A facilitator that accepts and never
+   * answers is treated like a lost answer (non-definitive: 409 for /settle). Default 18 s: longer than a
+   * slow but honest settle (ledger close plus one retry), shorter than the 20 s most proxies allow a
+   * request. Other requests for the same payment stop waiting for the lock after `lockWaitMs` (15 s)
+   * with 503, so a hung call costs the holder at most 18 s and nobody else more than 15 s.
+   */
+  facilitatorTimeoutMs?: number;
   /**
    * Extra seconds a `settlement_pending` record stays retryable after the
    * payment's own validity (`maxTimeoutSeconds` for the envelope time bounds
@@ -138,6 +146,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
   const confirmAttempts = cfg.confirmAttempts ?? 3;
   const confirmDelayMs = cfg.confirmDelayMs ?? 1500;
   const confirmTimeoutMs = cfg.confirmTimeoutMs ?? 5000;
+  const facilitatorTimeoutMs = cfg.facilitatorTimeoutMs ?? 18_000;
   const confirm = cfg.confirm ?? ((hash: string) => horizonStatus(fetchImpl, horizonUrl, hash));
   const graceMs = (cfg.pendingGraceSeconds ?? 30) * 1000;
   const store: PendingStore = cfg.pendingStore ?? new InMemoryPendingStore();
@@ -208,11 +217,14 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
    * 409 and the buyer re-sends; one payment can never produce two deliveries.
    */
   const deliver = async (
+    lease: LeaseHandle,
     rec: PendingRecord,
     resource: ResourceInfo,
     settlement: SettleResponse,
     payer: string | undefined,
   ): Promise<HandleResult> => {
+    // A holder whose lease was taken over neither writes nor delivers; the taker owns the outcome now.
+    if (!lease.held()) return pendingAnswer(resource, rec.requirements, settlement.transaction || rec.txHash);
     const mine = await store.consume(rec.digest, rec.claimKey);
     if (!mine) return pendingAnswer(resource, rec.requirements, settlement.transaction || rec.txHash);
     return { kind: "paid", headers: { [HEADER_PAYMENT_RESPONSE]: encodeHeader(settlement) }, settlement, payer };
@@ -225,20 +237,31 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     parse: (v: unknown) => T,
     claimKey?: string,
   ): Promise<FacilitatorCall<T>> {
-    let res: Response;
+    let res: Response | undefined;
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), facilitatorTimeoutMs);
     try {
-      res = await fetchImpl(`${facilitatorUrl}${path}`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(authorization ? { authorization } : {}),
-          ...(claimKey ? { "idempotency-key": claimKey } : {}),
-        },
-        body: JSON.stringify({ x402Version: 2, paymentPayload, paymentRequirements }),
-      });
+      // Raced against the clock as well as aborted: a fetch implementation that ignores the signal still ends.
+      res = await withTimeout(
+        fetchImpl(`${facilitatorUrl}${path}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(authorization ? { authorization } : {}),
+            ...(claimKey ? { "idempotency-key": claimKey } : {}),
+          },
+          body: JSON.stringify({ x402Version: 2, paymentPayload, paymentRequirements }),
+          signal: controller.signal,
+        }),
+        facilitatorTimeoutMs,
+        undefined,
+      );
     } catch {
-      return { ok: false, code: "facilitator_unreachable", definitive: false };
+      res = undefined;
+    } finally {
+      clearTimeout(abortTimer);
     }
+    if (!res) return { ok: false, code: "facilitator_unreachable", definitive: false };
     if (res.status >= 500) return { ok: false, code: "facilitator_unreachable", definitive: false };
     // 4xx is the facilitator refusing before any claim (auth, budget, malformed): definitive, nothing is pending.
     if (!res.ok) return { ok: false, code: "facilitator_refused", definitive: true };
@@ -265,6 +288,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
 
   /** Decide from a /settle answer made under `rec.claimKey` (ours). */
   async function afterSettle(
+    lease: LeaseHandle,
     rec: PendingRecord,
     call: FacilitatorCall<SettleResponse>,
     resource: ResourceInfo,
@@ -274,8 +298,15 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
   ): Promise<HandleResult> {
     const req = rec.requirements;
     const expired = rec.state === "expired";
+    /**
+     * Keep the record for a retry: an owner-checked conditional update, never an insert. If another
+     * holder consumed the record meanwhile (this lease lapsed), nothing is written; the buyer's retry finds
+     * no record, goes through /verify and is refused as a replay. A holder that cannot prove its lease
+     * does not write at all.
+     */
     const keep = async (txHash?: string): Promise<HandleResult> => {
-      await store.put({ ...rec, state: expired ? "expired" : "pending", ...(txHash ? { txHash } : {}) });
+      const next: PendingRecord = { ...rec, state: expired ? "expired" : "pending", ...(txHash ? { txHash } : {}) };
+      if (lease.held()) await store.update(next);
       return expired ? deny(price, resource, "settlement_expired", method) : pendingAnswer(resource, req, txHash ?? rec.txHash);
     };
     if (!call.ok) {
@@ -286,7 +317,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
       return keep();
     }
     const settle = call.value;
-    if (settle.success) return deliver(rec, resource, settle, settle.payer ?? payer);
+    if (settle.success) return deliver(lease, rec, resource, settle, settle.payer ?? payer);
     const reason = settle.errorReason ?? "settlement_failed";
     // Someone else's claim. Never a delivery, whatever the chain says.
     if (reason === "invalid_exact_stellar_payload_nonce_reused") {
@@ -304,7 +335,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
       return deny(price, resource, reason, method);
     }
     const status = await confirmed(hash);
-    if (status === "SUCCESS") return deliver(rec, resource, receipt(hash, req, settle.payer ?? payer), settle.payer ?? payer);
+    if (status === "SUCCESS") return deliver(lease, rec, resource, receipt(hash, req, settle.payer ?? payer), settle.payer ?? payer);
     if (status === "FAILED") {
       await store.delete(rec.digest);
       return deny(price, resource, "settle_exact_stellar_transaction_failed", method);
@@ -313,24 +344,24 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
   }
 
   /** A payment we have a record for: our claim, re-asked with our own claim key. */
-  async function resume(rec: PendingRecord, payload: PaymentPayload, resource: ResourceInfo, price: string, method: string): Promise<HandleResult> {
+  async function resume(lease: LeaseHandle, rec: PendingRecord, payload: PaymentPayload, resource: ResourceInfo, price: string, method: string): Promise<HandleResult> {
     if (rec.state !== "expired" && Date.now() >= rec.expiresAt) {
       rec = { ...rec, state: "expired" };
-      await store.put(rec);
+      if (lease.held()) await store.update(rec); // owner-checked; never re-creates a consumed record
     }
     if (rec.txHash) {
       const status = await confirmed(rec.txHash);
-      if (status === "SUCCESS") return deliver(rec, resource, receipt(rec.txHash, rec.requirements, undefined), undefined);
+      if (status === "SUCCESS") return deliver(lease, rec, resource, receipt(rec.txHash, rec.requirements, undefined), undefined);
       if (status === "FAILED") {
         await store.delete(rec.digest);
         return deny(price, resource, "settle_exact_stellar_transaction_failed", method);
       }
     }
     const call = await callFacilitator("/settle", payload, rec.requirements, (v) => SettleResponseSchema.parse(v), rec.claimKey);
-    return afterSettle(rec, call, resource, price, method, undefined);
+    return afterSettle(lease, rec, call, resource, price, method, undefined);
   }
 
-  async function handleLocked(digest: string, raw: string, { price, resource, method: rawMethod }: HandleInput): Promise<HandleResult> {
+  async function handleLocked(lease: LeaseHandle, digest: string, raw: string, { price, resource, method: rawMethod }: HandleInput): Promise<HandleResult> {
     const method = normalizeMethod(rawMethod ?? "GET");
     let payload: PaymentPayload;
     try {
@@ -357,7 +388,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     const existing = await store.get(digest);
     if (existing) {
       if (existing.resourceKey !== rk || existing.method !== method) return deny(price, resource, "resource_mismatch", method);
-      return resume(existing, payload, resource, price, method);
+      return resume(lease, existing, payload, resource, price, method);
     }
 
     const verify = await callFacilitator("/verify", payload, expected, (v) => VerifyResponseSchema.parse(v));
@@ -381,9 +412,9 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
       createdAt: now,
       expiresAt: now + expected.maxTimeoutSeconds * 2 * 1000 + graceMs,
     };
-    await store.put(rec);
+    if (!(await store.put(rec))) return pendingAnswer(resource, expected); // another holder is mid-flight on this payment
     const call = await callFacilitator("/settle", payload, expected, (v) => SettleResponseSchema.parse(v), rec.claimKey);
-    return afterSettle(rec, call, resource, price, method, verify.value.payer);
+    return afterSettle(lease, rec, call, resource, price, method, verify.value.payer);
   }
 
   return {
@@ -396,9 +427,9 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
       if (!raw) return deny(input.price, input.resource, "payment_required", method);
       const digest = createHash("sha256").update(raw).digest("hex");
       try {
-        return await store.withLock(digest, () => handleLocked(digest, raw, input));
+        return await store.withLock(digest, (lease) => handleLocked(lease, digest, raw, input));
       } catch (err) {
-        if (err instanceof PendingStoreBusyError) {
+        if (err instanceof PendingStoreBusyError || isStoreBusyError(err)) {
           return {
             kind: "busy",
             status: 503,
