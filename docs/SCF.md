@@ -27,7 +27,7 @@ Labels: **REAL** = runs on Stellar testnet from this repo; **TESTED** = unit tes
 
 Out of T1 scope and **ABSENT** in T1: Soroban settlement contract, mainnet, token issuance, any bridge, marketing copy.
 
-## T2 — settlement contract (branches `t2/settlement-contract` → `t2/rebase-main`, not merged to `main` as of 2026-10-23, testnet only, $0)
+## T2 — settlement contract (merged to `main` 2026-10-23, testnet only, $0)
 
 | Item | Delivered | State |
 |---|---|---|
