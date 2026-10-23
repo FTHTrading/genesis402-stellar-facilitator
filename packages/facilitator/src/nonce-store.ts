@@ -12,6 +12,12 @@ export interface NonceStore {
   isConsumed(network: string, payer: string, nonce: string): boolean;
   /** Returns true if the nonce was newly consumed, false if it was already present. */
   consume(network: string, payer: string, nonce: string, txHash: string): boolean;
+  /**
+   * Forgets a nonce. Only called when the network rejected the submission
+   * outright (sendTransaction status ERROR), so the signed entry can never
+   * have been applied on chain.
+   */
+  release(network: string, payer: string, nonce: string): void;
 }
 
 export class SqliteNonceStore implements NonceStore {
@@ -45,6 +51,12 @@ export class SqliteNonceStore implements NonceStore {
       )
       .run(network, payer, nonce, txHash);
     return result.changes === 1;
+  }
+
+  release(network: string, payer: string, nonce: string): void {
+    this.db
+      .prepare("DELETE FROM consumed_nonces WHERE network = ? AND payer = ? AND nonce = ?")
+      .run(network, payer, nonce);
   }
 
   close(): void {
