@@ -17,7 +17,9 @@
     "typecheck": "tsc -b --noEmit false",
     "test": "vitest run",
     "test:testnet": "STELLAR_TESTNET_TESTS=1 vitest run",
-    "demo:testnet": "tsx examples/payer/src/cli.ts"
+    "demo:testnet": "tsx examples/payer/src/cli.ts",
+    "test:contract": "cargo test --manifest-path contracts/x402-settle/Cargo.toml",
+    "test:contract:testnet": "T2_TESTNET=1 vitest run --config contracts/x402-settle/vitest.config.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
