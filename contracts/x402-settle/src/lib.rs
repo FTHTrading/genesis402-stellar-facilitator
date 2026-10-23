@@ -2,14 +2,18 @@
 //!
 //! One function moves money: `settle`. The payer authorizes exactly one
 //! invocation (contract, function, every argument) with `require_auth`; the
-//! contract then transfers `amount` of `token` from the payer to the seller,
-//! optionally splitting a flat `fee` (never a percentage) to the facilitator,
-//! and records `(payer, nonce)` in persistent storage so the same quote can
-//! never settle twice, from any process, on any facilitator.
+//! contract then transfers exactly `amount` of `token` from the payer to the
+//! seller and records `(payer, nonce)` in persistent storage so the same quote
+//! can never settle twice, from any process, on any facilitator.
 //!
-//! Deliberately admin-less: there is no upgrade key, no pause switch, no fee
-//! setter and no owner. v1 is immutable at its address; a v2 is a new contract
-//! at a new address that sellers opt into by quoting it. See README.md.
+//! No fee logic, by design: a per-settlement platform fee would be
+//! transaction-based compensation, which UnyKorn LLC's standing rule forbids.
+//! The facilitator's transaction fee is paid by the envelope source outside
+//! the contract; its revenue, if any, is a flat subscription outside the chain.
+//!
+//! Deliberately admin-less: there is no upgrade key, no pause switch and no
+//! owner. v1 is immutable at its address; a v2 is a new contract at a new
+//! address that sellers opt into by quoting it. See README.md.
 #![no_std]
 
 use soroban_sdk::{
@@ -38,12 +42,10 @@ pub enum Error {
     Expired = 2,
     /// `amount` is zero or negative.
     InvalidAmount = 3,
-    /// `fee` is negative, or not strictly smaller than `amount`.
-    InvalidFee = 4,
     /// `expiry_ledger` is more than `MAX_EXPIRY_WINDOW_LEDGERS` ahead.
-    ExpiryTooFar = 5,
-    /// `seller == payer`, or `facilitator == payer` while a fee is due.
-    InvalidParty = 6,
+    ExpiryTooFar = 4,
+    /// `seller == payer`.
+    InvalidParty = 5,
 }
 
 #[contracttype]
@@ -63,7 +65,6 @@ pub struct Settled {
     pub seller: Address,
     pub token: Address,
     pub amount: i128,
-    pub fee: i128,
     pub nonce: BytesN<32>,
     pub ledger: u32,
 }
@@ -73,38 +74,30 @@ pub struct X402Settle;
 
 #[contractimpl]
 impl X402Settle {
-    /// Settle one x402 quote.
+    /// Settle one x402 quote: move exactly `amount` of `token` from `payer` to `seller`.
     ///
     /// * `payer` must authorize this exact invocation (and, through the auth
-    ///   tree, the token transfers it causes).
-    /// * `amount` is what the payer pays, in the token's atomic units.
-    /// * `fee` is a flat amount out of `amount` that goes to `facilitator`;
-    ///   `0` means no facilitator transfer at all. The seller receives
-    ///   `amount - fee`.
+    ///   tree, the token transfer it causes).
+    /// * `amount` is what the payer pays, in the token's atomic units; the
+    ///   seller receives all of it.
     /// * `nonce` is the quote nonce; `(payer, nonce)` can settle once.
     /// * `expiry_ledger` is inclusive: the call is valid while
     ///   `current_ledger <= expiry_ledger`.
-    #[allow(clippy::too_many_arguments)]
     pub fn settle(
         env: Env,
         payer: Address,
         seller: Address,
         token: Address,
         amount: i128,
-        fee: i128,
         nonce: BytesN<32>,
         expiry_ledger: u32,
-        facilitator: Address,
     ) -> Result<(), Error> {
         payer.require_auth();
 
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
-        if fee < 0 || fee >= amount {
-            return Err(Error::InvalidFee);
-        }
-        if seller == payer || (fee > 0 && facilitator == payer) {
+        if seller == payer {
             return Err(Error::InvalidParty);
         }
 
@@ -127,14 +120,9 @@ impl X402Settle {
         let live_for = window.saturating_add(NONCE_RECOVERY_LEDGERS);
         store.extend_ttl(&key, live_for, live_for);
 
-        let client = token::TokenClient::new(&env, &token);
-        // `fee < amount` was checked above, so this cannot underflow.
-        client.transfer(&payer, &seller, &(amount - fee));
-        if fee > 0 {
-            client.transfer(&payer, &facilitator, &fee);
-        }
+        token::TokenClient::new(&env, &token).transfer(&payer, &seller, &amount);
 
-        Settled { payer, seller, token, amount, fee, nonce, ledger: current }.publish(&env);
+        Settled { payer, seller, token, amount, nonce, ledger: current }.publish(&env);
         Ok(())
     }
 

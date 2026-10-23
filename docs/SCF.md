@@ -29,9 +29,9 @@ Out of T1 scope and **ABSENT** in T1: Soroban settlement contract, mainnet, toke
 
 | Item | Delivered | State |
 |---|---|---|
-| Soroban contract `x402-settle`: `settle(payer, seller, token, amount, fee, nonce, expiry_ledger, facilitator)`, `is_settled`, `version`; payer `require_auth`, persistent `(payer, nonce)` guard with TTL extension, expiry check, flat fee split only when `fee > 0`, `settled` event, no admin or upgrade key | `contracts/x402-settle` | **TESTED on testnet**: `CA5LF4WBEXMFGX4BQCSLVEXVV6U3AUIQ55KNTSIQVD3HDEXAEEWFE5BC` (`contracts/x402-settle/DEPLOY-TESTNET.md`); **NOT DEPLOYED to mainnet** |
-| 20 Rust unit tests (success, replay, expired, wrong auth, zero and negative amount, insufficient balance, fee arithmetic, event) | `contracts/x402-settle/src/test.rs`, `cargo test` | **TESTED** |
-| Node integration test on testnet (`T2_TESTNET=1`): deploy, fund with the DEMO asset, settle once with a fee, read `is_settled`, replay refused on chain | `contracts/x402-settle/test/testnet.integration.test.ts` | **TESTED on testnet** (transcript in the T2 report) |
+| Soroban contract `x402-settle`: `settle(payer, seller, token, amount, nonce, expiry_ledger)`, `is_settled`, `version`; payer `require_auth`, persistent `(payer, nonce)` guard with TTL extension, expiry check, exactly `amount` payer to seller (no fee logic, by design: a per-settlement fee is transaction-based compensation), `settled` event, no admin or upgrade key | `contracts/x402-settle` | **TESTED on testnet**: `CAGID4DCA5IY7REZYHJWSTHU3BPE5VABPTRW3ASMNW3U7JK2XTTLE2MQ` (`contracts/x402-settle/DEPLOY-TESTNET.md`); **NOT DEPLOYED to mainnet** |
+| 18 Rust unit tests (success, replay, expired, wrong auth, zero and negative amount, insufficient balance, exact-amount arithmetic, event) | `contracts/x402-settle/src/test.rs`, `cargo test` | **TESTED** |
+| Node integration test on testnet (`T2_TESTNET=1`): deploy, fund with the DEMO asset, settle once, read `is_settled`, replay refused on chain | `contracts/x402-settle/test/testnet.integration.test.ts` | **TESTED on testnet** (transcript in the T2 report) |
 | Facilitator switch from direct token transfer to the contract | `docs/T2-contract-path.md` | design only; **not yet wired** |
 
 ## After award — tranches (from the application; nothing below exists yet)
