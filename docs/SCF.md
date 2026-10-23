@@ -18,7 +18,7 @@ Labels: **REAL** = runs on Stellar testnet from this repo; **TESTED** = unit tes
 | Discovery index + JSON schema; crawl manifests; list only after a real 402; `GET /discovery/resources?network=` | `packages/discovery` | **TESTED**; **NOT DEPLOYED** |
 | Reference seller and payer proving an end-to-end paid call on testnet | `examples/` | **REAL** (see the demo transcript in the T1 report) |
 | Testnet USDC | Circle testnet USDC contract `CBIELTK6…DAMA` supported and verified on Horizon; the automated demo issues `TUSDC` because Circle's faucet is a manual form | Circle USDC path: configured, **not exercised by the automated demo**; `TUSDC`: **DEMO** |
-| Tests: ≥25 vitest tests incl. six negative cases; testnet integration behind an env flag; crawler test with a mock seller; CI | 84 unit tests at the r1 review baseline (52b2e34), 203 at HEAD, plus 1 opt-in integration test, `.github/workflows/ci.yml` | **TESTED**; CI state is in the T1 report |
+| Tests: ≥25 vitest tests incl. six negative cases; testnet integration behind an env flag; crawler test with a mock seller; CI | 84 unit tests at the r1 review baseline (52b2e34), 217 at HEAD, plus 1 opt-in integration test, `.github/workflows/ci.yml` | **TESTED**; CI state is in the T1 report |
 | Review round r4 (2026-10-23): 1 Critical (SQLite lease takeover → double delivery), 1 Important, 7 Minor | all fixed test-first: atomic `consume` delivery gate, renewed leases, bounded facilitator check and Horizon confirm, 503 busy; nonce record read before entry expiry; stale-claim release reachable; share keyed by token in bearer mode and rejected above the budget; ambiguous sends charged; live records never evicted, tombstone sweep; IPv4-in-IPv6 unwrapped | **TESTED** |
 | Review round r3 (2026-10-23): 0 Critical, 4 Important, 7 Minor; ruling on durable seller state | all fixed test-first (ambiguous retried sends keep the claim, bearer in the SDK, strict numeric config, per-seller fee share, 4xx → 402, tombstones, strict hop count, IPv6 /64, token-scoped claim keys, hash-then-compare, stale-claim release; `pendingStore` option with a SQLite adapter) | **TESTED** |
 | Review round r1 (failure-path reviewer, 2026-10-23): 6 Important + 10 Minor findings | all fixed test-first; the reviewer retired the one r1 test that contradicted the replay rule | **TESTED** |
@@ -27,12 +27,12 @@ Labels: **REAL** = runs on Stellar testnet from this repo; **TESTED** = unit tes
 
 Out of T1 scope and **ABSENT** in T1: Soroban settlement contract, mainnet, token issuance, any bridge, marketing copy.
 
-## T2 — settlement contract (branch `t2/settlement-contract`, testnet only, $0)
+## T2 — settlement contract (branches `t2/settlement-contract` → `t2/rebase-main`, not merged to `main` as of 2026-10-23, testnet only, $0)
 
 | Item | Delivered | State |
 |---|---|---|
 | Soroban contract `x402-settle`: `settle(payer, seller, token, amount, fee, nonce, expiry_ledger, facilitator)`, `is_settled`, `version`; payer `require_auth`, persistent `(payer, nonce)` guard with TTL extension, expiry check, flat fee split only when `fee > 0`, `settled` event, no admin or upgrade key | `contracts/x402-settle` | **TESTED on testnet**: `CA5LF4WBEXMFGX4BQCSLVEXVV6U3AUIQ55KNTSIQVD3HDEXAEEWFE5BC` (`contracts/x402-settle/DEPLOY-TESTNET.md`); **NOT DEPLOYED to mainnet** |
-| 20 Rust unit tests (success, replay, expired, wrong auth, zero and negative amount, insufficient balance, fee arithmetic, event) | `contracts/x402-settle/src/test.rs`, `cargo test` | **TESTED** |
+| Rust unit tests (success, replay, expired, wrong auth, zero and negative amount, insufficient balance, fee arithmetic, event): 23 `#[test]` functions on `t2/rebase-main`, 18 on `t2/settlement-contract`, none on `main` (grep count 2026-10-23; the pass count is the T2 report's, from `cargo test` on that branch) | `contracts/x402-settle/src/test.rs`, `cargo test` | **TESTED** on the T2 branch; **ABSENT** from `main` until T2 merges |
 | Node integration test on testnet (`T2_TESTNET=1`): deploy, fund with the DEMO asset, settle once with a fee, read `is_settled`, replay refused on chain | `contracts/x402-settle/test/testnet.integration.test.ts` | **TESTED on testnet** (transcript in the T2 report) |
 | Facilitator switch from direct token transfer to the contract | `docs/T2-contract-path.md` | design only; **not yet wired** |
 
@@ -41,7 +41,7 @@ Out of T1 scope and **ABSENT** in T1: Soroban settlement contract, mainnet, toke
 | Tranche | Share | Deliverable | State today |
 |---|---|---|---|
 | T1 MVP | 20% | the contents of this repository, plus a public testnet facilitator URL | code **REAL/TESTED**; public URL **NOT DEPLOYED** |
-| T2 Testnet | 30% | Soroban settlement contract (escrow-settle, replay protection, fee split) with unit and integration coverage; discovery UI; 50 Genesis402 endpoints on the Stellar lane on testnet; 100 calls/min load test; public testnet demo | **ABSENT** |
+| T2 Testnet | 30% | Soroban settlement contract (escrow-settle, replay protection, fee split) with unit and integration coverage; discovery UI; 50 Genesis402 endpoints on the Stellar lane on testnet; 100 calls/min load test; public testnet demo | contract **TESTED on testnet** on branch `t2/rebase-main`, not on `main`, not wired to the facilitator (see the T2 section above); discovery UI, 50 endpoints, load test and public demo **ABSENT** |
 | T3 Mainnet | remaining | mainnet deployment with documented rollback, threat model and monitoring plan, alerting on settlement failures, Genesis402's own endpoints switched to the Stellar lane | **ABSENT**; requires a separate review and sign-off |
 
 ## Success measure offered to the panel

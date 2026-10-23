@@ -59,9 +59,9 @@ flowchart TB
 2. Transaction: parses, is not a fee bump, has exactly one `invokeHostFunction`; neither tx source nor op source is a facilitator address.
 3. Invocation: contract equals `requirements.asset`; function `transfer` with 3 args; `from` is not the facilitator; `to == payTo`; `amount == requirements.amount` as i128.
 4. Authorization entries: at least one; every entry uses `sorobanCredentialsAddress` or `sorobanCredentialsAddressV2` (CAP-71); no facilitator address; no sub-invocations; the authorized invocation equals the operation byte for byte; exactly one entry for `from`.
-5. Expiry: `currentLedger < signatureExpirationLedger <= currentLedger + ceil(maxTimeoutSeconds / ledgerSeconds) + 2`.
-6. Signature: the payer entry carries one `{public_key, signature}` whose key equals `from`, and the Ed25519 signature verifies over `sha256(HashIdPreimage(network, nonce, expiry, invocation[, address]))`.
-7. Nonce: `(network, payer, nonce)` not present in `consumed_nonces`.
+5. Signature: the payer entry carries one `{public_key, signature}` whose key equals `from`, and the Ed25519 signature verifies over `sha256(HashIdPreimage(network, nonce, expiry, invocation[, address]))`.
+6. Nonce: `(network, payer, nonce)` not present in `consumed_nonces`. Checked after the signature (a forged envelope with a spent nonce is `bad_signature`, not `nonce_reused`) and before the expiry window, so a seller re-asking with its claim key after the entry's ledger still reads the recorded outcome (r4 I-r4-2, r5 M-r5-7).
+7. Expiry: `currentLedger < signatureExpirationLedger <= currentLedger + ceil(maxTimeoutSeconds / ledgerSeconds) + 2`.
 8. Rebuild with the facilitator as source (inclusion fee 100 stroops), simulate on Soroban RPC; the simulation must succeed and `minResourceFee + 100 <= 50,000`.
 9. Events: the simulation's contract events contain exactly one `transfer` and it is `from → payTo` for the exact amount on `asset`.
 10. Settle only: claim the nonce (atomic insert), assemble with the simulation's footprint and resource fee, sign, `sendTransaction`, poll `getTransaction` until `SUCCESS` or `FAILED`. A `sendTransaction` status of `ERROR` releases the nonce because nothing reached the ledger.
