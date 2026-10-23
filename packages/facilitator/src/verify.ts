@@ -38,7 +38,7 @@ export type StaticResult =
       invokeOp: Operation.InvokeHostFunction;
       authEntry: xdr.SorobanAuthorizationEntry;
     }
-  | { ok: false; reason: string; message?: string; payer?: string };
+  | { ok: false; reason: string; message?: string; payer?: string; nonce?: string };
 
 function fail(reason: string, payer?: string, message?: string): StaticResult {
   return { ok: false, reason, ...(payer ? { payer } : {}), ...(message ? { message } : {}) };
@@ -134,6 +134,9 @@ export function verifyStatic(
   if (ctx.facilitatorAddresses.has(from)) {
     return fail("invalid_exact_stellar_payload_facilitator_is_payer");
   }
+  if (ctx.facilitatorAddresses.has(to) || ctx.facilitatorAddresses.has(requirements.payTo)) {
+    return fail("invalid_exact_stellar_payload_facilitator_is_recipient", from);
+  }
   if (to !== requirements.payTo) return fail("invalid_exact_stellar_payload_wrong_recipient", from);
   if (amount !== BigInt(requirements.amount)) {
     return fail("invalid_exact_stellar_payload_wrong_amount", from);
@@ -202,9 +205,13 @@ export function verifyStatic(
   if (!signatureValid) return fail("invalid_exact_stellar_payload_bad_signature", from);
 
   const nonce = creds.nonce.toString();
-  if (ctx.nonceStore.isConsumed(requirements.network, from, nonce)) {
-    return fail("invalid_exact_stellar_payload_nonce_reused", from);
+  let consumed: boolean;
+  try {
+    consumed = ctx.nonceStore.isConsumed(requirements.network, from, nonce);
+  } catch (err) {
+    return fail("nonce_store_unavailable", from, (err as Error).message);
   }
+  if (consumed) return { ok: false, reason: "invalid_exact_stellar_payload_nonce_reused", payer: from, nonce };
 
   return {
     ok: true,

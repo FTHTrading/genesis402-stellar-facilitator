@@ -1,3 +1,4 @@
+import { Keypair } from "@stellar/stellar-sdk";
 import { describe, expect, it } from "vitest";
 import { StellarFacilitator } from "../src/facilitator.js";
 import { SqliteNonceStore } from "../src/nonce-store.js";
@@ -101,12 +102,13 @@ describe("StellarFacilitator.settle", () => {
     const { f } = make();
     const req = requirements();
     const payload = await signedPayload(req);
-    expect((await f.settle(payload, req)).success).toBe(true);
+    const first = await f.settle(payload, req);
+    expect(first.success).toBe(true);
     const again = await f.settle(payload, req);
     expect(again).toMatchObject({
       success: false,
       errorReason: "invalid_exact_stellar_payload_nonce_reused",
-      transaction: "",
+      transaction: first.transaction,
     });
     expect(await f.verify(payload, req)).toMatchObject({ isValid: false });
   });
@@ -135,7 +137,7 @@ describe("StellarFacilitator.settle", () => {
   it("returns the static failure reason without touching the chain", async () => {
     const { chain, f } = make();
     const req = requirements();
-    const res = await f.settle(await signedPayload(req, { payTo: facilitator.publicKey() }), req);
+    const res = await f.settle(await signedPayload(req, { payTo: Keypair.random().publicKey() }), req);
     expect(res).toMatchObject({
       success: false,
       errorReason: "invalid_exact_stellar_payload_wrong_recipient",
@@ -154,7 +156,7 @@ describe("StellarFacilitator.supported", () => {
         x402Version: 2,
         scheme: "exact",
         network: "stellar:testnet",
-        extra: { areFeesSponsored: true },
+        extra: { areFeesSponsored: true, assets: ["CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"] },
       },
     ]);
     expect(s.signers["stellar:*"]).toEqual([facilitator.publicKey()]);

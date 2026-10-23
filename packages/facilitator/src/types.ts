@@ -53,17 +53,17 @@ export const FacilitatorRequestSchema = z.object({
 });
 export type FacilitatorRequest = z.infer<typeof FacilitatorRequestSchema>;
 
+/** Responses carry fixed reason codes only; causes are logged server-side, never returned. */
 export interface VerifyResponse {
   isValid: boolean;
   invalidReason?: string;
-  invalidMessage?: string;
   payer?: string;
 }
 
 export interface SettleResponse {
   success: boolean;
   errorReason?: string;
-  errorMessage?: string;
+  /** Tx hash when an envelope was submitted (or a replay names the one that consumed the entry); else "". */
   transaction: string;
   network: string;
   payer?: string;
