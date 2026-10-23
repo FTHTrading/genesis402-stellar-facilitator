@@ -9,7 +9,8 @@ import { createSellerApp } from "./index.js";
  *   ASSET_CONTRACT    optional token contract (default USDC on the network)
  *   PORT              default 4023
  */
-if (process.argv[1] && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, "/")}`).href) {
+// Main-module guard that holds on Windows (C:\...) and POSIX (/home/...) under node and tsx.
+if (process.argv[1] && import.meta.url === new URL("file:///" + process.argv[1].replace(/\\/g, "/").replace(/^\/+/, "")).href) {
   const port = Number(process.env["PORT"] ?? 4023);
   const payTo = process.env["SELLER_ADDRESS"];
   if (!payTo) throw new Error("SELLER_ADDRESS is required");

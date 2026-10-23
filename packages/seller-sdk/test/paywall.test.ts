@@ -112,7 +112,7 @@ describe("createPaywall", () => {
     const { calls, fetchImpl } = mockFacilitator({ valid: false, reason: "invalid_exact_stellar_payload_wrong_recipient" });
     const pw = paywall(fetchImpl);
     const headers = new Headers({
-      "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, accepted: pw.requirements("0.01"), payload: { transaction: "AAAA" } }),
+      "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, resource, accepted: pw.requirements("0.01"), payload: { transaction: "AAAA" } }),
     });
     const res = await pw.handle({ price: "0.01", resource, headers });
     expect(res.kind).toBe("payment_required");
@@ -125,7 +125,7 @@ describe("createPaywall", () => {
     const { fetchImpl } = mockFacilitator({ success: false });
     const pw = paywall(fetchImpl);
     const headers = new Headers({
-      "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, accepted: pw.requirements("0.01"), payload: { transaction: "AAAA" } }),
+      "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, resource, accepted: pw.requirements("0.01"), payload: { transaction: "AAAA" } }),
     });
     const res = await pw.handle({ price: "0.01", resource, headers });
     expect(res.kind).toBe("payment_required");

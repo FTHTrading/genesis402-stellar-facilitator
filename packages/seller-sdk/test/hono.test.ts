@@ -21,7 +21,14 @@ describe("honoPaywall middleware", () => {
     const quote = (await unpaid.json()) as { accepts: unknown[] };
 
     const paid = await app.request("http://seller.example/weather", {
-      headers: { "PAYMENT-SIGNATURE": encodeHeader({ x402Version: 2, accepted: quote.accepts[0], payload: { transaction: "AAAA" } }) },
+      headers: {
+        "PAYMENT-SIGNATURE": encodeHeader({
+          x402Version: 2,
+          resource: { url: "http://seller.example/weather" },
+          accepted: quote.accepts[0],
+          payload: { transaction: "AAAA" },
+        }),
+      },
     });
     expect(paid.status).toBe(200);
     expect(await paid.json()).toEqual({ tempC: 21 });

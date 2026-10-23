@@ -8,8 +8,9 @@ import {
   type PaymentRequired,
   type PaymentRequirements,
 } from "@genesis402/stellar-seller-sdk";
+import { pinnedInit } from "./pinned-fetch.js";
 import type { ResourceRecord } from "./schema.js";
-import { TargetNotAllowedError, assertSafeTarget, type GuardOptions, type Resolver } from "./url-guard.js";
+import { TargetNotAllowedError, resolveSafeTarget, type GuardOptions, type Resolver } from "./url-guard.js";
 
 /** Hard limits on what one crawl may pull in. */
 export const MAX_BODY_BYTES = 256 * 1024;
@@ -35,6 +36,7 @@ export class CrawlError extends Error {
 }
 
 export interface CrawlOptions extends GuardOptions {
+  /** Injectable fetch. When omitted the global fetch is used with DNS pinned to the guard's answer. */
   fetch?: typeof fetch;
   /** Only list resources payable on this CAIP-2 namespace prefix; default "stellar:". */
   networkPrefix?: string;
@@ -65,11 +67,13 @@ export interface CrawlResult {
  *
  * Trust boundary: the manifest is attacker-controlled input. The seller's
  * identity is the manifest URL's origin; endpoints on any other origin are
- * never fetched; every URL passes the SSRF guard; redirects are not followed;
- * bodies are capped at 256 KiB; at most 50 services are examined.
+ * never fetched; every URL passes the SSRF guard and the connection is pinned
+ * to the vetted addresses; redirects are not followed; bodies are capped at
+ * 256 KiB; at most 50 services are examined, 4 at a time.
  */
 export async function crawlManifest(manifestUrl: string, opts: CrawlOptions = {}): Promise<CrawlResult> {
-  const fetchImpl = opts.fetch ?? globalThis.fetch;
+  const injected = opts.fetch;
+  const fetchImpl = injected ?? globalThis.fetch;
   const prefix = opts.networkPrefix ?? "stellar:";
   const now = opts.now ?? (() => new Date());
   const timeoutMs = opts.timeoutMs ?? 15_000;
@@ -78,17 +82,22 @@ export async function crawlManifest(manifestUrl: string, opts: CrawlOptions = {}
     ...(opts.allowHttp ? { allowHttp: true } : {}),
     ...(opts.allowPrivate ? { allowPrivate: true } : {}),
   };
+  /** With the global fetch, pin DNS to what the guard saw; an injected fetch (tests) is used as-is. */
+  const withPin = (init: RequestInit, addresses: string[]): RequestInit =>
+    injected ? init : pinnedInit(init, addresses);
 
-  await guardOrThrow(manifestUrl, guard);
+  const manifestAddresses = await guardOrThrow(manifestUrl, guard);
   const manifestOrigin = new URL(manifestUrl).origin;
 
   let manifestRes: Response;
   try {
-    manifestRes = await fetchImpl(manifestUrl, {
-      redirect: "manual",
-      headers: { accept: "application/json" },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    manifestRes = await fetchImpl(
+      manifestUrl,
+      withPin(
+        { redirect: "manual", headers: { accept: "application/json" }, signal: AbortSignal.timeout(timeoutMs) },
+        manifestAddresses,
+      ),
+    );
   } catch (err) {
     throw new CrawlError("manifest_unreachable", (err as Error).message);
   }
@@ -124,14 +133,16 @@ export async function crawlManifest(manifestUrl: string, opts: CrawlOptions = {}
     if (endpointOrigin !== manifestOrigin) {
       return { skip: { endpoint: service.endpoint, reason: "cross_origin_endpoint" } };
     }
+    // Same origin as the manifest, so the vetted addresses apply; re-run the guard anyway (cheap, literal check).
+    let addresses: string[];
     try {
-      await assertSafeTarget(service.endpoint, guard);
+      addresses = await resolveSafeTarget(service.endpoint, { ...guard, resolve: async () => manifestAddresses });
     } catch {
       return { skip: { endpoint: service.endpoint, reason: "target_not_allowed" } };
     }
     let quote: PaymentRequired;
     try {
-      quote = await fetchQuote(fetchImpl, service, timeoutMs);
+      quote = await fetchQuote(fetchImpl, service, timeoutMs, (init) => withPin(init, addresses));
     } catch (err) {
       const message = (err as Error).message;
       return {
@@ -179,9 +190,9 @@ export async function crawlManifest(manifestUrl: string, opts: CrawlOptions = {}
   return { manifest_url: manifestUrl, seller_origin: manifestOrigin, listed, skipped };
 }
 
-async function guardOrThrow(url: string, guard: GuardOptions): Promise<void> {
+async function guardOrThrow(url: string, guard: GuardOptions): Promise<string[]> {
   try {
-    await assertSafeTarget(url, guard);
+    return await resolveSafeTarget(url, guard);
   } catch (err) {
     if (err instanceof TargetNotAllowedError) throw new CrawlError("target_not_allowed", err.message);
     throw err;
@@ -228,7 +239,12 @@ function sameLane(a: PaymentRequirements, b: PaymentRequirements): boolean {
   );
 }
 
-async function fetchQuote(fetchImpl: typeof fetch, service: ManifestService, timeoutMs: number): Promise<PaymentRequired> {
+async function fetchQuote(
+  fetchImpl: typeof fetch,
+  service: ManifestService,
+  timeoutMs: number,
+  pin: (init: RequestInit) => RequestInit,
+): Promise<PaymentRequired> {
   const init: RequestInit = {
     method: service.method,
     redirect: "manual",
@@ -239,7 +255,7 @@ async function fetchQuote(fetchImpl: typeof fetch, service: ManifestService, tim
     init.headers = { ...init.headers, "content-type": "application/json" };
     init.body = "{}";
   }
-  const res = await fetchImpl(service.endpoint, init);
+  const res = await fetchImpl(service.endpoint, pin(init));
   if (res.status !== 402) throw new Error(`expected_402_got_${res.status}`);
   const candidates: unknown[] = [];
   const header = res.headers.get(HEADER_PAYMENT_REQUIRED);

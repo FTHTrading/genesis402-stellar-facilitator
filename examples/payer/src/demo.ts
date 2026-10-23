@@ -133,6 +133,8 @@ export async function runTestnetDemo(
     signer: keys.facilitator,
     chain: new RpcChainClient({ network, rpcUrl, horizonUrl }),
     nonceStore: new SqliteNonceStore(":memory:"),
+    // Allowlist: Circle USDC always; the DEMO asset only because this demo issued it.
+    allowedAssets: [USDC_SAC[network]!, asset.contract],
   });
   const fac = await listen(createApp(facilitator).fetch);
   log(`facilitator API ${fac.url}`);

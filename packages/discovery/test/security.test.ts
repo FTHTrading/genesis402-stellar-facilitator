@@ -201,12 +201,13 @@ describe("discovery API hardening", () => {
     expect(JSON.stringify(job)).not.toMatch(/10\.0\.0\.5|stack|ENOTFOUND|Error:/);
   });
 
-  it("rate-limits registrations per client IP", async () => {
+  it("rate-limits registrations per client IP (behind a trusted proxy)", async () => {
     const app = createDiscoveryApp({
       index: new SqliteResourceIndex(":memory:"),
       fetch: async () => Response.json({}),
       resolve: publicResolver,
       registrationsPerWindow: 3,
+      trustProxy: true,
     });
     const post = (ip: string) =>
       app.request("/discovery/sellers", {

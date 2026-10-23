@@ -4,13 +4,21 @@ import { SqliteResourceIndex } from "./index-store.js";
 
 /**
  * Standalone discovery index.
- *   DISCOVERY_DB_PATH   SQLite file (default ./discovery.sqlite)
- *   PORT                default 4022
+ *   DISCOVERY_DB_PATH        SQLite file (default ./discovery.sqlite)
+ *   TRUST_PROXY=1            trust X-Forwarded-For for client identity (only behind a proxy that sets it)
+ *   DISCOVERY_ALLOW_LOCAL=1  permit http:// and private crawl targets (local development only)
+ *   PORT                     default 4022
  */
-if (process.argv[1] && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, "/")}`).href) {
+// Main-module guard that holds on Windows (C:\...) and POSIX (/home/...) under node and tsx.
+if (process.argv[1] && import.meta.url === new URL("file:///" + process.argv[1].replace(/\\/g, "/").replace(/^\/+/, "")).href) {
   const index = new SqliteResourceIndex(process.env["DISCOVERY_DB_PATH"] ?? "./discovery.sqlite");
   const port = Number(process.env["PORT"] ?? 4022);
-  serve({ fetch: createDiscoveryApp({ index }).fetch, port }, (info) => {
+  const app = createDiscoveryApp({
+    index,
+    trustProxy: process.env["TRUST_PROXY"] === "1",
+    allowLocalTargets: process.env["DISCOVERY_ALLOW_LOCAL"] === "1",
+  });
+  serve({ fetch: app.fetch, port }, (info) => {
     console.log(`genesis402-stellar-discovery listening on http://localhost:${info.port}`);
   });
 }
