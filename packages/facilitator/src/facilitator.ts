@@ -65,11 +65,12 @@ export interface FacilitatorOptions {
   feeBudgetStroopsPerHour?: number;
   /**
    * Fees one seller (payTo, or the bearer token in bearer mode) may consume per
-   * trailing hour. Default: a quarter of the global budget, but never less than
-   * one maximum-fee settlement
-   * (`max(floor(budget / 4), maxTransactionFeeStroops)`), so a single seller —
-   * honest or hostile — can never take the hour from everyone else; it takes
-   * four distinct sellers acting together to exhaust the global budget. With
+   * trailing hour. Default: a quarter of the global budget, never less than one
+   * maximum-fee settlement and never more than the budget itself
+   * (`min(max(floor(budget / 4), maxTransactionFeeStroops), budget)`), so a
+   * single seller — honest or hostile — can never take the hour from everyone
+   * else; it takes four distinct sellers acting together to exhaust the global
+   * budget. An explicit value above the budget is refused at construction. With
    * the defaults (5,000,000 / 4 = 1,250,000) and the testnet demo fee of
    * 16,860 stroops that is 74 settlements per seller per hour.
    */

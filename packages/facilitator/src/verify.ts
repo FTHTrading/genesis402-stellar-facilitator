@@ -173,26 +173,6 @@ export function verifyStatic(
 
   const creds = addressCredentials(payerEntry.credentials)!;
   const expirationLedger = creds.signatureExpirationLedger;
-  // Replay is checked before expiry on purpose: a consumed entry is spent whatever its ledger, and the
-  // claimant that spent it must be able to read its outcome back (same claim key) even after the
-  // entry's validity has ended. Nothing below this line is reached for a consumed entry.
-  const nonce = creds.nonce.toString();
-  let consumed: boolean;
-  try {
-    consumed = ctx.nonceStore.isConsumed(requirements.network, from, nonce);
-  } catch (err) {
-    return fail("nonce_store_unavailable", from, (err as Error).message);
-  }
-  if (consumed) return { ok: false, reason: "invalid_exact_stellar_payload_nonce_reused", payer: from, nonce };
-  if (expirationLedger <= ctx.currentLedger) {
-    return fail("invalid_exact_stellar_signature_expired", from);
-  }
-  const maxLedger =
-    ctx.currentLedger + Math.ceil(requirements.maxTimeoutSeconds / ctx.estimatedLedgerSeconds);
-  if (expirationLedger > maxLedger + SIGNATURE_EXPIRATION_LEDGER_TOLERANCE) {
-    return fail("invalid_exact_stellar_signature_expiration_too_far", from);
-  }
-
   const info = inspectAuthEntry(payerEntry);
   const signer = info.signers[0];
   const signatures = signer?.signatures ?? null;
@@ -214,6 +194,29 @@ export function verifyStatic(
     signatureValid = false;
   }
   if (!signatureValid) return fail("invalid_exact_stellar_payload_bad_signature", from);
+
+  // Replay is checked after the signature (a forged envelope carrying a spent nonce is a bad signature,
+  // not a replay) but before the expiry window: a consumed entry is spent whatever its ledger, and the
+  // claimant that spent it must be able to read its outcome back (same claim key) even after the
+  // entry's validity has ended. Nothing below this line is reached for a consumed entry.
+  const nonce = creds.nonce.toString();
+  let consumed: boolean;
+  try {
+    consumed = ctx.nonceStore.isConsumed(requirements.network, from, nonce);
+  } catch (err) {
+    return fail("nonce_store_unavailable", from, (err as Error).message);
+  }
+  if (consumed) return { ok: false, reason: "invalid_exact_stellar_payload_nonce_reused", payer: from, nonce };
+
+  if (expirationLedger <= ctx.currentLedger) {
+    return fail("invalid_exact_stellar_signature_expired", from);
+  }
+  const maxLedger =
+    ctx.currentLedger + Math.ceil(requirements.maxTimeoutSeconds / ctx.estimatedLedgerSeconds);
+  if (expirationLedger > maxLedger + SIGNATURE_EXPIRATION_LEDGER_TOLERANCE) {
+    return fail("invalid_exact_stellar_signature_expiration_too_far", from);
+  }
+
 
   return {
     ok: true,
