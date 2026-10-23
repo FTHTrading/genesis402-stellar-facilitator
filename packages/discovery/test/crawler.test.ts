@@ -3,10 +3,12 @@ import { crawlManifest } from "../src/crawler.js";
 import { ResourceRecordSchema } from "../src/schema.js";
 import { ORIGIN, SELLER, mockSeller } from "./mock-seller.js";
 
+const publicResolver = async () => ["93.184.216.34"];
+
 describe("crawlManifest", () => {
   it("lists a resource only after fetching a real 402 quote from it", async () => {
     const seller = mockSeller();
-    const result = await crawlManifest(seller.manifestUrl, { fetch: seller.fetchImpl });
+    const result = await crawlManifest(seller.manifestUrl, { fetch: seller.fetchImpl, resolve: publicResolver });
     expect(result.listed.map((r) => r.name).sort()).toEqual(["quote", "weather"]);
     expect(result.skipped).toEqual([]);
     const weather = result.listed.find((r) => r.name === "weather")!;
@@ -27,7 +29,7 @@ describe("crawlManifest", () => {
 
   it("skips a service that answers 200 instead of 402", async () => {
     const seller = mockSeller({ overrides: { weather: "free" } });
-    const result = await crawlManifest(seller.manifestUrl, { fetch: seller.fetchImpl });
+    const result = await crawlManifest(seller.manifestUrl, { fetch: seller.fetchImpl, resolve: publicResolver });
     expect(result.listed.map((r) => r.name)).toEqual(["quote"]);
     expect(result.skipped).toEqual([
       { endpoint: `${ORIGIN}/weather`, reason: "expected_402_got_200" },
@@ -36,15 +38,15 @@ describe("crawlManifest", () => {
 
   it("skips a service whose live quote disagrees with its manifest entry", async () => {
     const seller = mockSeller({ overrides: { quote: "lie" } });
-    const result = await crawlManifest(seller.manifestUrl, { fetch: seller.fetchImpl });
+    const result = await crawlManifest(seller.manifestUrl, { fetch: seller.fetchImpl, resolve: publicResolver });
     expect(result.listed.map((r) => r.name)).toEqual(["weather"]);
     expect(result.skipped[0]).toMatchObject({ endpoint: `${ORIGIN}/quote`, reason: "quote_mismatch" });
   });
 
   it("fails clearly on a manifest that does not validate", async () => {
     const fetchImpl: typeof fetch = async () => Response.json({ x402Version: 1, services: "nope" });
-    await expect(crawlManifest("https://bad.example/.well-known/x402", { fetch: fetchImpl })).rejects.toThrow(
-      /manifest/i,
-    );
+    await expect(
+      crawlManifest("https://bad.example/.well-known/x402", { fetch: fetchImpl, resolve: publicResolver }),
+    ).rejects.toMatchObject({ code: "manifest_invalid" });
   });
 });

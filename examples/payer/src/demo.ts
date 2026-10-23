@@ -147,7 +147,10 @@ export async function runTestnetDemo(
   });
   log(`seller API      ${seller.url}`);
 
-  const discovery = await listen(createDiscoveryApp({ index: new SqliteResourceIndex(":memory:") }).fetch);
+  // allowLocalTargets: the demo seller lives on 127.0.0.1; a public index must never set this.
+  const discovery = await listen(
+    createDiscoveryApp({ index: new SqliteResourceIndex(":memory:"), allowLocalTargets: true }).fetch,
+  );
   log(`discovery API   ${discovery.url}`);
 
   try {
@@ -156,8 +159,14 @@ export async function runTestnetDemo(
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ manifest_url: `${seller.url}/.well-known/x402` }),
     });
-    const regBody = (await reg.json()) as { listed: number; skipped: unknown[] };
-    log(`discovery crawled seller: listed=${regBody.listed} skipped=${JSON.stringify(regBody.skipped)}`);
+    const { job_id } = (await reg.json()) as { job_id: string };
+    let job: { status: string; listed?: number; skipped?: unknown[]; error?: string } = { status: "queued" };
+    for (let i = 0; i < 200 && job.status !== "done" && job.status !== "failed"; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      job = (await (await fetch(`${discovery.url}/discovery/jobs/${job_id}`)).json()) as typeof job;
+    }
+    if (job.status !== "done") throw new Error(`discovery crawl ${job.status}: ${job.error ?? ""}`);
+    log(`discovery crawled seller (job ${job_id}): listed=${job.listed} skipped=${JSON.stringify(job.skipped)}`);
     const listRes = await fetch(`${discovery.url}/discovery/resources?network=${network}`);
     const listed = (await listRes.json()) as { resources: Array<{ endpoint: string }> };
     const discovered = listed.resources.map((r) => r.endpoint);
