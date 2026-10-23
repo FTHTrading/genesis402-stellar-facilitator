@@ -233,10 +233,18 @@ export function bucketOf(ip: string): string {
   const v = isIP(s);
   if (v === 4) return s;
   if (v === 6) {
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(s);
-    if (mapped) return mapped[1]!;
-    const groups = expand6(s);
-    return groups ? `${groups.slice(0, 4).map((g) => g.toString(16)).join(":")}::/64` : s;
+    const dotted = /^(.*):(\d+\.\d+\.\d+\.\d+)$/.exec(s);
+    const groups = dotted ? expand6(`${dotted[1]}:0:0`) : expand6(s);
+    if (!groups) return s;
+    const [g0, g1, g2, g3, g4, g5, g6, g7] = groups as [number, number, number, number, number, number, number, number];
+    const embedded = dotted ? dotted[2]! : `${g6 >> 8}.${g6 & 255}.${g7 >> 8}.${g7 & 255}`;
+    const zero4 = g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0;
+    // IPv4 carried inside IPv6: identify the IPv4 client, not the carrier prefix (M-r4-6).
+    if (zero4 && g4 === 0 && g5 === 0xffff) return embedded; // ::ffff:a.b.c.d (dotted or hex)
+    if (zero4 && g4 === 0xffff && g5 === 0) return embedded; // ::ffff:0:a.b.c.d (SIIT)
+    if (g0 === 0x0064 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) return embedded; // 64:ff9b::/96 NAT64
+    if (g0 === 0x0064 && g1 === 0xff9b && g2 === 1) return embedded; // 64:ff9b:1::/48 local-use NAT64
+    return `${groups.slice(0, 4).map((g) => g.toString(16)).join(":")}::/64`;
   }
   return s;
 }
