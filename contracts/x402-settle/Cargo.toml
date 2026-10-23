@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "x402 settlement contract for Stellar: payer-authorized, nonce-guarded transfer of a token amount to a seller with an optional flat facilitator fee. Admin-less, immutable v1."
+description = "x402 settlement contract for Stellar: payer-authorized, nonce-guarded transfer of exactly the quoted amount of a token from payer to seller, with a readable settlement record. No fee logic. Admin-less, immutable v1."
 
 [lib]
 crate-type = ["cdylib", "rlib"]

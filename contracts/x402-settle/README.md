@@ -9,7 +9,8 @@ State: **TESTED on testnet** (`CAGID4DCA5IY7REZYHJWSTHU3BPE5VABPTRW3ASMNW3U7JK2X
 ```rust
 fn settle(payer: Address, seller: Address, token: Address, amount: i128,
           nonce: BytesN<32>, expiry_ledger: u32) -> Result<(), Error>;
-fn is_settled(payer: Address, nonce: BytesN<32>) -> bool;
+fn settlement(payer: Address, nonce: BytesN<32>) -> Option<Settlement>; // { seller, token, amount, ledger }
+fn is_settled(payer: Address, nonce: BytesN<32>) -> bool;              // nonce consumed, nothing more
 fn version() -> u32; // 1
 ```
 
@@ -17,11 +18,15 @@ fn version() -> u32; // 1
 
 1. `payer.require_auth()` — the payer authorizes exactly this invocation (contract, function, every argument) and, through the auth tree, the one token transfer it causes. Nobody else can trigger it; the facilitator only pays the network transaction fee as the envelope's source.
 2. Refuses `amount <= 0` (`InvalidAmount`), `seller == payer` (`InvalidParty`), `expiry_ledger < current` (`Expired`), `expiry_ledger` more than 1,000,000 ledgers ahead (`ExpiryTooFar`).
-3. Refuses `(payer, nonce)` already present (`AlreadySettled`). Otherwise writes it to persistent storage and extends its TTL to the quote window plus about 7 days so `is_settled` stays readable for recovery.
+3. Refuses `(payer, nonce)` already present (`AlreadySettled`). Otherwise writes `Settlement { seller, token, amount, ledger }` under that key in persistent storage and asks for a TTL of the quote window plus about 7 days so the record stays readable for recovery. The host clamps the TTL at the network's `max_entry_ttl - 1` (live testnet value UNVERIFIED here), so a long window can see the record archived before the quote expires; an archived key still refuses replay (it cannot be touched until restored, and once restored it reads `AlreadySettled`; after expiry `Expired` fires first).
 4. `token.transfer(payer, seller, amount)`: exactly the quoted amount, all of it to the seller.
 5. Emits `settled` with topics `("settled", payer, seller)` and data `{token, amount, nonce, ledger}`.
 
 A failed transfer (for example insufficient balance) rolls the whole invocation back, so the nonce is not consumed.
+
+## Reading a settlement
+
+`settlement(payer, nonce)` returns what was actually settled. A seller delivers only when the record's `seller`, `token` and `amount` equal its own quote. `is_settled(payer, nonce)` says only that the nonce is consumed: the payer may have settled 1 stroop to an address it controls, or an amount on a token that moves nothing, under the seller's nonce (review r1, I-1). That consumes the nonce and blocks the honest settle with `AlreadySettled`, but it cannot make the record match the quote, so a seller that matches the record is not fooled and simply re-quotes with a fresh nonce.
 
 ## No fee logic, by design
 
@@ -39,7 +44,7 @@ cargo test                     # 18 unit tests, no network
 stellar contract build         # target/wasm32v1-none/release/x402_settle.wasm
 ```
 
-Testnet integration (deploys a fresh instance, pays with the DEMO asset TUSDC issued per run, settles once, reads `is_settled`, proves the replay is refused on chain):
+Testnet integration (deploys a fresh instance, pays with the DEMO asset TUSDC issued per run, settles once, reads `settlement` and `is_settled`, and shows a re-signed replay refused in simulation against live ledger state with `Error(Contract, #1)`):
 
 ```
 T2_TESTNET=1 npx vitest run --config contracts/x402-settle/vitest.config.ts

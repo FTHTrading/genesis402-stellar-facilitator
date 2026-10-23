@@ -8,7 +8,7 @@ State: the contract is **TESTED on testnet** (`CAGID4DCA5IY7REZYHJWSTHU3BPE5VABP
 |---|---|---|
 | Transaction the buyer's payload carries | one `invokeHostFunction` calling `transfer(from=payer, to=seller, amount)` on the **token** contract | one `invokeHostFunction` calling `settle(payer, seller, token, amount, nonce, expiry_ledger)` on the **x402-settle** contract |
 | What the payer's authorization entry authorizes | the token `transfer` invocation (root), no sub-invocations | the `settle` invocation (root) **with** its one sub-invocation `token.transfer(payer, seller, amount)`. Simulation produces this tree; the payer signs over all of it (CAP-71 V2 credentials, as the T2 integration test does) |
-| Replay protection | facilitator-local SQLite `consumed_nonces` plus the ledger's one-time auth nonce | the same two, **plus** the contract's persistent `(payer, nonce)` entry, which every facilitator process and every seller can read |
+| Replay protection | facilitator-local SQLite `consumed_nonces` plus the ledger's one-time auth nonce | the same two, **plus** the contract's persistent record under `(payer, nonce)` (`Settlement { seller, token, amount, ledger }`), which every facilitator process and every seller can read with `settlement(payer, nonce)` |
 | Fee to the facilitator | none; the facilitator pays the network fee | none; the contract has no fee logic. A per-settlement platform fee is transaction-based compensation, which UnyKorn's standing rule forbids; facilitator revenue, if any, is a flat subscription outside the chain |
 
 The `nonce` argument is the quote nonce from the 402 (`accepts[].extra.nonce`, 32 bytes, hex). It is unrelated to the Soroban auth nonce the SDK picks when signing the entry.
@@ -22,6 +22,8 @@ Steps 1, 2, 5, 6, 7 of the T1 order in `ARCHITECTURE.md` stay. Step 3 (invocatio
 - `payer` is not a facilitator address; `seller == requirements.payTo`; `token == requirements.asset`; `amount == requirements.amount` as i128;
 - `nonce` equals `requirements.extra.nonce`; `expiry_ledger` is within the same window as the auth entry's `signatureExpirationLedger`.
 
+The verifier checks these arguments **before** settlement, so the facilitator never submits a `settle` whose seller, token or amount differ from the quote. The record check through `settlement` is for recovery and for sellers that did not see the submission.
+
 Step 4 (authorization entries) changes in one place: the payer's entry is allowed, and required, to carry exactly one sub-invocation, the token `transfer(payer, payTo, amount)` the contract will perform, byte for byte, with no others. Step 9 (events) then expects one `settled` event from the contract plus one `transfer` event from the token, and nothing else.
 
 The asset allowlist (r1 I-2) still applies to `token`. The settlement contract is a second allowlist entry, by network.
@@ -29,8 +31,8 @@ The asset allowlist (r1 I-2) still applies to `token`. The settlement contract i
 ## What the on-chain nonce buys
 
 1. **Cross-process replay protection.** In T1 the "nonce not reused" rule lives in one SQLite file. Two facilitator processes, or a restored backup, or a seller that switches facilitators, can each be shown the same signed payload once. With the contract, the second `settle` fails inside the ledger with `Error(Contract, #1) AlreadySettled`, whichever process submits it. The SQLite table stays as a cheap pre-check; it is no longer the safety boundary.
-2. **Recovery by reading state.** The T1 review left two limits open: "pending state is per seller process" and "replay refusal is final". With the contract, a seller (or the facilitator) that lost its memory of a settlement asks the chain: `is_settled(payer, nonce)`. `true` means the buyer paid for this quote; deliver the resource (the `settled` event carries seller, token, amount and ledger if a receipt is needed). `false` means nothing landed; the quote may be re-settled or re-quoted. The facilitator's own `nonce_reused` answer can be checked the same way, so a refusal is no longer the end of the conversation.
-3. **Receipts that do not depend on us.** The `settled{payer, seller, token, amount, nonce, ledger}` event is public ledger data keyed by the quote nonce; any party can prove a payment without the facilitator's database.
+2. **Recovery by reading state, matched against the quote.** The T1 review left two limits open: "pending state is per seller process" and "replay refusal is final". With the contract, a seller (or the facilitator) that lost its memory of a settlement reads `settlement(payer, nonce)` and **delivers only if the record's `seller` equals its `payTo`, `token` equals its quoted asset and `amount` equals its quoted amount** (and, when it has the transaction, the `settled` event in that transaction carries the same values). `None` means nothing landed under that nonce; the quote may be re-settled or re-quoted. A record that does not match the quote means the payer consumed the nonce some other way (review r1, I-1: a payer can settle 1 stroop to an address it controls, or an amount on a token that moves nothing, under the seller's nonce, and can thereby front-run and block the honest settle with `AlreadySettled`); the seller must not deliver, and should issue a fresh quote with a new nonce. `is_settled(payer, nonce)` is kept as a cheap boolean but **means only that the nonce is consumed**; it is never, on its own, a reason to deliver. The facilitator's `nonce_reused` answer can be resolved the same way, so a refusal is no longer the end of the conversation.
+3. **Receipts that do not depend on us.** The `settled{payer, seller, token, amount, nonce, ledger}` event and the stored record are public ledger data keyed by the quote nonce; any party can prove a payment, and what it paid for, without the facilitator's database.
 
 What it does not buy: the contract does not escrow, does not hold funds (the transfer goes payer to seller inside one invocation, authorized by the payer), takes nothing for anyone, and does not reduce the network fee the facilitator sponsors; a `settle` costs a little more than a bare `transfer` (one extra persistent entry write).
 
@@ -46,5 +48,5 @@ The official x402 Stellar scheme implementation is `@x402/stellar` (npm; 2.28.0 
 
 1. `verify.ts`: accept the `settle` shape above behind a per-network `settlementContract` setting; keep the direct-transfer shape for backwards compatibility until sellers have moved.
 2. `client.ts`: `buildSettlePayload(...)` that simulates, signs the payer's entry including sub-invocations, and emits the x402 v2 payload.
-3. Seller SDK: quote `extra.nonce`; on `nonce_reused` or a lost pending record, read `is_settled` and deliver when `true`.
+3. Seller SDK: quote `extra.nonce`; on `nonce_reused` or a lost pending record, read `settlement(payer, nonce)` and deliver only when `seller`, `token` and `amount` all match the quote; never deliver on `is_settled` alone.
 4. Tests first for each: the six negative cases plus `extra sub-invocation`, `sub-invocation amount != amount`, `wrong settlement contract`.

@@ -2,6 +2,7 @@
 
 use super::*;
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
     Address, BytesN, Env, Event as _, IntoVal,
@@ -269,4 +270,79 @@ fn nonce_stays_readable_after_the_quote_expired() {
 fn version_is_one() {
     let f = setup(1);
     assert_eq!(f.client().version(), 1);
+}
+
+// ---------- review r1, I-1: the record behind the nonce ----------
+
+/// A token whose `transfer` moves nothing (review r1 attack: "token that moves nothing").
+#[contract]
+pub struct NoopToken;
+
+#[contractimpl]
+impl NoopToken {
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+}
+
+#[test]
+fn settlement_record_holds_seller_token_amount_and_ledger() {
+    let f = setup(10_000_000);
+    let c = f.client();
+    let n = nonce(&f.env, 20);
+    assert_eq!(c.settlement(&f.payer, &n), None);
+    c.settle(&f.payer, &f.seller, &f.token, &1_000_000, &n, &(START_LEDGER + 100));
+    assert_eq!(
+        c.settlement(&f.payer, &n),
+        Some(Settlement { seller: f.seller.clone(), token: f.token.clone(), amount: 1_000_000, ledger: START_LEDGER })
+    );
+    assert!(c.is_settled(&f.payer, &n));
+}
+
+#[test]
+fn self_settle_under_the_quote_nonce_is_visible_in_the_record() {
+    // Attack: payer settles 1 stroop to an address it controls under the seller's quote nonce.
+    // The nonce is consumed, but the record names the wrong seller and amount, so a seller that
+    // matches the record to its quote does not deliver.
+    let f = setup(10_000_000);
+    let c = f.client();
+    let quote_nonce = nonce(&f.env, 21);
+    let payer_alt = Address::generate(&f.env);
+    c.settle(&f.payer, &payer_alt, &f.token, &1, &quote_nonce, &(START_LEDGER + 10));
+    let rec = c.settlement(&f.payer, &quote_nonce).unwrap();
+    assert_ne!(rec.seller, f.seller);
+    assert_eq!(rec.amount, 1);
+    assert!(c.is_settled(&f.payer, &quote_nonce), "is_settled only says the nonce is consumed");
+    assert_eq!(balance(&f.env, &f.token, &f.seller), 0);
+}
+
+#[test]
+fn noop_token_settle_is_visible_in_the_record() {
+    let f = setup(10_000_000);
+    let c = f.client();
+    let fake = f.env.register(NoopToken, ());
+    let quote_nonce = nonce(&f.env, 22);
+    c.settle(&f.payer, &f.seller, &fake, &1_000_000, &quote_nonce, &(START_LEDGER + 10));
+    let rec = c.settlement(&f.payer, &quote_nonce).unwrap();
+    assert_ne!(rec.token, f.token, "record names the fake token, not the quoted one");
+    assert_eq!(balance(&f.env, &f.token, &f.seller), 0);
+}
+
+#[test]
+fn front_run_is_refused_for_the_honest_settle_and_the_record_shows_why() {
+    let f = setup(10_000_000);
+    let c = f.client();
+    let quote_nonce = nonce(&f.env, 23);
+    let payer_alt = Address::generate(&f.env);
+    c.settle(&f.payer, &payer_alt, &f.token, &1, &quote_nonce, &(START_LEDGER + 10));
+    let honest = c.try_settle(&f.payer, &f.seller, &f.token, &1_000_000, &quote_nonce, &(START_LEDGER + 10));
+    assert_eq!(honest, Err(Ok(Error::AlreadySettled)));
+    let rec = c.settlement(&f.payer, &quote_nonce).unwrap();
+    // The seller can tell: the record does not match its quote (seller, amount).
+    assert!(rec.seller != f.seller || rec.amount != 1_000_000);
+    assert_eq!(balance(&f.env, &f.token, &f.seller), 0);
+}
+
+#[test]
+fn settlement_is_none_for_an_unknown_nonce() {
+    let f = setup(1);
+    assert_eq!(f.client().settlement(&Address::generate(&f.env), &nonce(&f.env, 24)), None);
 }

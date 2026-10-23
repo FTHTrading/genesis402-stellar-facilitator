@@ -3,8 +3,10 @@
 //! One function moves money: `settle`. The payer authorizes exactly one
 //! invocation (contract, function, every argument) with `require_auth`; the
 //! contract then transfers exactly `amount` of `token` from the payer to the
-//! seller and records `(payer, nonce)` in persistent storage so the same quote
-//! can never settle twice, from any process, on any facilitator.
+//! seller and records a `Settlement { seller, token, amount, ledger }` under
+//! `(payer, nonce)` in persistent storage, so the same quote can never settle
+//! twice, from any process, on any facilitator, and so a seller can read back
+//! what was actually settled and compare it with its own quote.
 //!
 //! No fee logic, by design: a per-settlement platform fee would be
 //! transaction-based compensation, which UnyKorn LLC's standing rule forbids.
@@ -26,10 +28,16 @@ use soroban_sdk::{
 /// stay valid and keeps the nonce TTL well under any network's maximum entry TTL.
 pub const MAX_EXPIRY_WINDOW_LEDGERS: u32 = 1_000_000;
 
-/// How long (in ledgers, about 7 days at 5 s) a consumed nonce stays readable
-/// beyond its quote expiry so `is_settled` can be used for recovery. After the
-/// entry is archived a replay is still refused, because its `expiry_ledger`
-/// is then in the past.
+/// Requested extra lifetime (in ledgers, about 7 days at 5 s) for the
+/// settlement record beyond the quote expiry, so `settlement` / `is_settled`
+/// stay readable for recovery. The host clamps `extend_ttl` at the network's
+/// `max_entry_ttl - 1` from the current ledger (observed in the SDK test env;
+/// the live testnet value is UNVERIFIED here), so for a long quote window the
+/// entry can be archived before the quote expires. Archival never re-opens a
+/// quote: touching an archived key fails until it is restored
+/// (`RestoreFootprintOp`), and once restored the record is present again and
+/// `settle` answers `AlreadySettled`; after `expiry_ledger` the `Expired` check
+/// refuses first. Reading a record after archival therefore needs a restore.
 pub const NONCE_RECOVERY_LEDGERS: u32 = 120_960;
 
 #[contracterror]
@@ -51,8 +59,20 @@ pub enum Error {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// Consumed nonce, keyed by payer and the quote nonce.
+    /// Settlement record, keyed by payer and the quote nonce.
     Settled(Address, BytesN<32>),
+}
+
+/// What was settled under `(payer, nonce)`. A seller delivers only when
+/// `seller`, `token` and `amount` equal its own quote; the nonce alone proves
+/// nothing about who was paid.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Settlement {
+    pub seller: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub ledger: u32,
 }
 
 /// Emitted once per successful `settle`. Topics: `"settled"`, payer, seller.
@@ -115,8 +135,9 @@ impl X402Settle {
         if store.has(&key) {
             return Err(Error::AlreadySettled);
         }
-        // Mark before moving funds; a failed transfer rolls the whole invocation back.
-        store.set(&key, &true);
+        // Record before moving funds; a failed transfer rolls the whole invocation back.
+        let record = Settlement { seller: seller.clone(), token: token.clone(), amount, ledger: current };
+        store.set(&key, &record);
         let live_for = window.saturating_add(NONCE_RECOVERY_LEDGERS);
         store.extend_ttl(&key, live_for, live_for);
 
@@ -126,7 +147,16 @@ impl X402Settle {
         Ok(())
     }
 
-    /// `true` once `(payer, nonce)` has settled through this contract.
+    /// The settlement recorded under `(payer, nonce)`, or `None`. This is what
+    /// a seller or facilitator reads to decide delivery: compare `seller`,
+    /// `token` and `amount` with the quote.
+    pub fn settlement(env: Env, payer: Address, nonce: BytesN<32>) -> Option<Settlement> {
+        env.storage().persistent().get(&DataKey::Settled(payer, nonce))
+    }
+
+    /// `true` once `(payer, nonce)` is consumed. It says only that: the payer
+    /// may have settled any amount to any address under this nonce. Use
+    /// `settlement` to learn what was paid to whom.
     pub fn is_settled(env: Env, payer: Address, nonce: BytesN<32>) -> bool {
         env.storage()
             .persistent()

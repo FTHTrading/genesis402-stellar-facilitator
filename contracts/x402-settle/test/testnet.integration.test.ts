@@ -192,32 +192,48 @@ async function buildSettle(
   return { tx, sim };
 }
 
-async function readIsSettled(ctx: TestnetContext, contractId: string, payer: string, nonce: Buffer, reader: Keypair): Promise<boolean> {
+/** Read-only call through simulation against live ledger state. */
+async function readCall<T>(ctx: TestnetContext, contractId: string, fn: string, args: xdr.ScVal[], reader: Keypair): Promise<T> {
   const source = await withRetry(() => ctx.horizon.loadAccount(reader.publicKey()));
   const tx = new TransactionBuilder(source, { fee: BASE_FEE, networkPassphrase: ctx.networkPassphrase })
-    .addOperation(
-      Operation.invokeContractFunction({
-        contract: contractId,
-        function: "is_settled",
-        args: [new Address(payer).toScVal(), xdr.ScVal.scvBytes(nonce)],
-      }),
-    )
+    .addOperation(Operation.invokeContractFunction({ contract: contractId, function: fn, args }))
     .setTimeout(60)
     .build();
   const sim = await withRetry(() => ctx.server.simulateTransaction(tx));
-  if (rpc.Api.isSimulationError(sim)) throw new Error(`is_settled simulation failed: ${sim.error}`);
-  return scValToNative(sim.result!.retval) as boolean;
+  if (rpc.Api.isSimulationError(sim)) throw new Error(`${fn} simulation failed: ${sim.error}`);
+  return scValToNative(sim.result!.retval) as T;
+}
+
+async function readIsSettled(ctx: TestnetContext, contractId: string, payer: string, nonce: Buffer, reader: Keypair): Promise<boolean> {
+  return readCall<boolean>(ctx, contractId, "is_settled", [new Address(payer).toScVal(), xdr.ScVal.scvBytes(nonce)], reader);
+}
+
+interface SettlementRecord {
+  seller: string;
+  token: string;
+  amount: bigint;
+  ledger: number;
+}
+
+async function readSettlement(ctx: TestnetContext, contractId: string, payer: string, nonce: Buffer, reader: Keypair): Promise<SettlementRecord | null> {
+  const v = await readCall<SettlementRecord | null | undefined>(ctx, contractId, "settlement", [new Address(payer).toScVal(), xdr.ScVal.scvBytes(nonce)], reader);
+  return v ?? null;
 }
 
 /**
  * Real Stellar testnet run of the x402-settle contract. Opt in with T2_TESTNET=1.
  * Deploys a fresh instance from the locally built wasm (or reuses
  * X402_SETTLE_CONTRACT_ID), pays with the DEMO asset TUSDC issued per run,
- * settles once, reads is_settled, and proves that a second
- * payer-signed attempt on the same quote nonce is refused by the contract on chain.
+ * settles once, reads settlement/is_settled, and shows that a second
+ * payer-signed attempt on the same quote nonce is refused by the contract in
+ * simulation against live ledger state (Error(Contract, #1)).
+ *
+ * Delivery rule exercised here: a seller delivers only when the settlement
+ * record's seller, token and amount equal its quote; is_settled alone proves
+ * only that the nonce is consumed.
  */
 describe.skipIf(!enabled)("x402-settle on Stellar testnet", () => {
-  it("deploys, settles once, reads is_settled, refuses the replay on chain", async () => {
+  it("deploys, settles once, reads a matching settlement record, refuses the re-signed replay in simulation", async () => {
     // T2_TRANSCRIPT=<path> also appends every line to a file (vitest hides console output of passing tests).
     const transcript = process.env["T2_TRANSCRIPT"];
     const log = (line: string) => {
@@ -265,6 +281,7 @@ describe.skipIf(!enabled)("x402-settle on Stellar testnet", () => {
       expiryLedger: latest.sequence + 120,
     };
     expect(await readIsSettled(ctx, contractId, quote.payer, quote.nonce, k.facilitator)).toBe(false);
+    expect(await readSettlement(ctx, contractId, quote.payer, quote.nonce, k.facilitator)).toBeNull();
 
     const before = {
       payer: await classicBalance(ctx, quote.payer, asset.code, asset.issuer),
@@ -278,7 +295,14 @@ describe.skipIf(!enabled)("x402-settle on Stellar testnet", () => {
     log(`settle tx   https://stellar.expert/explorer/testnet/tx/${settled.txHash}`);
     expect(settled.status).toBe(rpc.Api.GetTransactionStatus.SUCCESS);
 
-    // 2. is_settled reads true.
+    // 2. The record matches the quote (this is the delivery rule); is_settled reads true.
+    const record = await readSettlement(ctx, contractId, quote.payer, quote.nonce, k.facilitator);
+    expect(record).not.toBeNull();
+    expect(record!.seller).toBe(quote.seller);
+    expect(record!.token).toBe(quote.token);
+    expect(BigInt(record!.amount)).toBe(quote.amount);
+    expect(record!.ledger).toBeGreaterThan(0);
+    log(`settlement  seller=${record!.seller} token=${record!.token} amount=${record!.amount} ledger=${record!.ledger} (matches quote)`);
     expect(await readIsSettled(ctx, contractId, quote.payer, quote.nonce, k.facilitator)).toBe(true);
 
     // 3. Balances: payer -amount, seller +amount, exactly (7 decimals). No fee anywhere.
@@ -292,11 +316,12 @@ describe.skipIf(!enabled)("x402-settle on Stellar testnet", () => {
     log(`balances    payer ${before.payer} -> ${after.payer}; seller ${before.seller} -> ${after.seller}`);
 
     // 4. Replay: the payer signs the same quote again (fresh auth signature, same contract nonce).
-    //    The contract refuses with Error #1 AlreadySettled against live ledger state; nothing moves.
+    //    Simulation against live ledger state refuses it with Error(Contract, #1) AlreadySettled, so
+    //    no replay envelope can even be assembled; nothing moves. (Not a submitted FAILED tx.)
     const replay = await buildSettle(ctx, contractId, quote, k.payer, k.facilitator);
     expect(rpc.Api.isSimulationError(replay.sim)).toBe(true);
     const err = (replay.sim as rpc.Api.SimulateTransactionErrorResponse).error;
-    log(`replay      refused by contract: ${err.match(/Error\(Contract, #\d+\)/)?.[0] ?? err.slice(0, 160)}`);
+    log(`replay      refused in simulation against live ledger state: ${err.match(/Error\(Contract, #\d+\)/)?.[0] ?? err.slice(0, 160)}`);
     expect(err).toMatch(/Error\(Contract, #1\)/);
     expect(await classicBalance(ctx, quote.seller, asset.code, asset.issuer)).toBe(after.seller);
 
@@ -311,7 +336,8 @@ describe.skipIf(!enabled)("x402-settle on Stellar testnet", () => {
     log(`  settle tx    ${settled.txHash}`);
     log(`  asset        ${asset.code} ${asset.contract} [${asset.label}]`);
     log(`  amount       ${quote.amount} stroops of TUSDC, payer -> seller, no fee`);
+    log(`  settlement   matches quote (seller, token, amount)`);
     log(`  is_settled   true`);
-    log(`  replay       refused (Error(Contract, #1) AlreadySettled)`);
+    log(`  replay       refused in simulation against live ledger state (Error(Contract, #1) AlreadySettled)`);
   }, 600_000);
 });
