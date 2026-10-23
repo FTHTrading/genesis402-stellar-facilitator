@@ -1,4 +1,5 @@
 import { serve } from "@hono/node-server";
+import { realpathSync } from "node:fs";
 import { createSellerApp } from "./index.js";
 
 /**
@@ -9,7 +10,12 @@ import { createSellerApp } from "./index.js";
  *   ASSET_CONTRACT    optional token contract (default USDC on the network)
  *   PORT              default 4023
  */
-// Main-module guard that holds on Windows (C:\...) and POSIX (/home/...) under node and tsx.
+// Main-module guard that holds on Windows (C:\...) and POSIX (/home/...) under node and tsx, and through symlinks.
+try {
+  if (process.argv[1]) process.argv[1] = realpathSync(process.argv[1]);
+} catch {
+  /* leave argv[1] as given */
+}
 if (process.argv[1] && import.meta.url === new URL("file:///" + process.argv[1].replace(/\\/g, "/").replace(/^\/+/, "")).href) {
   const port = Number(process.env["PORT"] ?? 4023);
   const payTo = process.env["SELLER_ADDRESS"];

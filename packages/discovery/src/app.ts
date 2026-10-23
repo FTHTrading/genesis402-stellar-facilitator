@@ -19,6 +19,13 @@ export interface DiscoveryAppOptions {
    * address identifies the client and forwarded headers are ignored.
    */
   trustProxy?: boolean;
+  /**
+   * How many proxy hops in front of this process append to X-Forwarded-For.
+   * The client is the entry that many hops from the right (default 1: the
+   * last appended entry, i.e. the peer of the outermost proxy). Left-hand
+   * entries are client-supplied and never used.
+   */
+  trustProxyHops?: number;
   /** Registrations accepted per client per window (default 5 per 10 minutes). */
   registrationsPerWindow?: number;
   rateWindowMs?: number;
@@ -115,7 +122,7 @@ export function createDiscoveryApp(opts: DiscoveryAppOptions): Hono {
   });
 
   app.post("/discovery/sellers", async (c) => {
-    const { key, identified } = clientKey(c, opts.trustProxy === true);
+    const { key, identified } = clientKey(c, opts.trustProxy === true, opts.trustProxyHops ?? 1);
     const allowance = identified ? perWindow : perWindow * UNIDENTIFIED_MULTIPLIER;
     const t = now();
     const hits = (buckets.get(key) ?? []).filter((x) => t - x < windowMs);
@@ -186,17 +193,21 @@ export function createDiscoveryApp(opts: DiscoveryAppOptions): Hono {
 }
 
 /**
- * Who is registering. With a trusted proxy, the first X-Forwarded-For hop.
- * Otherwise the socket address; forwarded headers from a direct client are
- * ignored for identity and such clients share one bucket (they are lying about
- * a proxy that is not there). With neither socket nor trusted header (embedded
- * use, tests) the client is unidentified and only the coarse bucket applies.
+ * Who is registering. With a trusted proxy, the X-Forwarded-For entry `hops`
+ * from the right: appending proxies (nginx `$proxy_add_x_forwarded_for`, ALB,
+ * Cloudflare) put the real peer last, and anything to its left is whatever the
+ * client chose to send. Otherwise the socket address; forwarded headers from a
+ * direct client are ignored for identity and such clients share one bucket.
+ * With neither socket nor trusted header (embedded use, tests) the client is
+ * unidentified and only the coarse bucket applies.
  */
-export function clientKey(c: Context, trustProxy: boolean): { key: string; identified: boolean } {
+export function clientKey(c: Context, trustProxy: boolean, hops = 1): { key: string; identified: boolean } {
   const xff = c.req.header("x-forwarded-for");
   const realIp = c.req.header("x-real-ip");
   if (trustProxy) {
-    const ip = xff?.split(",")[0]?.trim() || realIp?.trim();
+    const chain = (xff ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    const n = Math.max(1, Math.floor(hops));
+    const ip = chain.length >= n ? chain[chain.length - n] : chain.length > 0 ? chain[0] : realIp?.trim();
     if (ip) return { key: `proxy:${ip}`, identified: true };
   }
   let socketIp: string | undefined;
