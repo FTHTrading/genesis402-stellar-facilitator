@@ -12,7 +12,7 @@ Apache-2.0. Copyright 2026 UnyKorn LLC (Wyoming). Contact: kevan@unykorn.org.
 | Facilitator: simulate with facilitator as source, transfer-event check, fee ceiling, submit, wait for inclusion | `packages/facilitator/src/facilitator.ts`, `chain.ts` | **REAL on testnet** (one settled payment per demo run, see below) |
 | Facilitator HTTP API `/supported`, `/verify`, `/settle`, `/health` | `packages/facilitator/src/app.ts` | **TESTED**; runs in-process in the demo. **NOT DEPLOYED** to any public host |
 | Seller SDK: 402 quote, verify+settle through the facilitator, Hono middleware, `/.well-known/x402` manifest | `packages/seller-sdk` | **TESTED** |
-| Discovery index: crawler that lists a resource only after a real 402, SQLite index, `GET /discovery/resources`, queued registration | `packages/discovery` | **TESTED**; **NOT DEPLOYED** |
+| Discovery index: crawler that lists a resource only after a real 402, SSRF guard with DNS pinning, SQLite index, `GET /discovery/resources`, queued and rate-limited registration | `packages/discovery` | **TESTED**; **NOT DEPLOYED** |
 | Reference seller (two paid routes + manifest) and payer demo | `examples/` | **REAL on testnet** when run with `npm run demo:testnet` |
 | Payment asset in the demo | `TUSDC`, issued per run by a throwaway testnet issuer | **DEMO**. Not USDC, no value. Circle's testnet USDC works unchanged if the payer holds some (see below) |
 | Stellar mainnet (`stellar:pubnet`) | constants only | **NOT DEPLOYED**, out of scope for T1 |
@@ -63,18 +63,27 @@ Wire format is x402 v2 and the `exact` scheme for Stellar as specified in [coinb
 | `POST /settle` | same body → `{ success, transaction, network, payer, amount?, errorReason? }` |
 | Seller `GET /.well-known/x402` | x402 v2 manifest: `provider`, `services[]` with `endpoint`, `method`, `price_usd`, `accepts[]`, `input_schema`, `output_schema` |
 | Index `GET /discovery/resources?network=stellar:testnet&max_amount=&category=&q=` | listed resources; `GET /discovery/schema` gives the JSON Schema |
-| Index `POST /discovery/sellers {manifest_url}` | `202 { job_id }`; poll `GET /discovery/jobs/:id` |
+| Index `POST /discovery/sellers {manifest_url}` | `202 { job_id }`; poll `GET /discovery/jobs/:id`. Rate-limited per client (socket address, or `X-Forwarded-For` only with `TRUST_PROXY=1`); bounded queue (`503 queue_full`) |
+| Seller route, ambiguous settlement | `409 { error: "settlement_pending", accepts, transaction? }` — re-send the same `PAYMENT-SIGNATURE` |
 
-Verification rules (all enforced before any fee is paid): x402Version 2; scheme `exact`; one `invokeHostFunction` op; contract equals `asset`; function `transfer` with three args; `to` equals `payTo`; amount equals `amount` exactly; facilitator is not tx source, op source, `from`, or any auth address; address-type credentials only; no sub-invocations; auth invocation equals the operation; expiry after the current ledger and no later than `current + ceil(maxTimeoutSeconds / ledgerSeconds) + 2`; Ed25519 signature verifies locally against `from`; nonce not already consumed; simulation succeeds; simulation shows exactly one transfer `from → payTo` of the exact amount on `asset`; simulation fee plus inclusion fee under the 50,000-stroop ceiling.
+Settlement rules added in review round r1:
+
+- **Asset allowlist.** The facilitator sponsors only token contracts in `ALLOWED_ASSETS` (default: Circle USDC on the network). Anything else is refused at `/verify` with `invalid_exact_stellar_payload_asset_not_allowed`. The demo adds its `TUSDC` contract explicitly; a public instance must not.
+- **One settlement at a time per signer.** A Stellar account has one sequence number, so settles are serialized with an in-process mutex; throughput is one settlement per ledger per signer. Channel accounts are the T2 answer. `TRY_AGAIN_LATER` and `ERROR` from `sendTransaction` release the buyer's nonce (the envelope was not admitted); a thrown send keeps it (ambiguous).
+- **Never charge twice.** If the facilitator's answer after submission is ambiguous (HTTP 5xx, `not_confirmed`, `unexpected_settle_error`), the seller SDK checks Horizon for the transaction hash and delivers when it is included; otherwise it answers HTTP 409 `settlement_pending` with the same terms and the buyer re-sends the **same** `PAYMENT-SIGNATURE`. A fresh 402 is never issued for a payment that may have landed.
+- **Payment bound to the resource.** `payload.resource.url` must name the route being paid (origin + path); a header signed for `/weather` is refused on `/echo` with `resource_mismatch`.
+- **Fixed error codes only.** No facilitator, RPC or Horizon text is ever forwarded to a buyer or to a discovery client.
+
+Verification rules (all enforced before any fee is paid): asset on the allowlist; x402Version 2; scheme `exact`; one `invokeHostFunction` op; contract equals `asset`; function `transfer` with three args; `to` equals `payTo`; amount equals `amount` exactly; facilitator is not tx source, op source, `from`, or any auth address; address-type credentials only; no sub-invocations; auth invocation equals the operation; expiry after the current ledger and no later than `current + ceil(maxTimeoutSeconds / ledgerSeconds) + 2`; Ed25519 signature verifies locally against `from`; nonce not already consumed; simulation succeeds; simulation shows exactly one transfer `from → payTo` of the exact amount on `asset`; simulation fee plus inclusion fee under the 50,000-stroop ceiling.
 
 ## Tests
 
 ```bash
-npm test                 # 80 unit tests, no network
+npm test                 # unit tests, no network
 npm run test:testnet     # adds the real testnet round trip (STELLAR_TESTNET_TESTS=1), about a minute
 ```
 
-Negative cases required by the brief, all in `packages/facilitator/test/verify-static.test.ts`: wrong amount, wrong destination, expired, replayed nonce, wrong asset, tampered signature. Discovery abuse cases are in `packages/discovery/test/security.test.ts`.
+Counts: 84 unit tests at the r1 review baseline (commit 52b2e34); HEAD runs 122 passing plus the one env-gated testnet test (`npm test` prints the current number; CI runs it on every push). Negative cases required by the brief, all in `packages/facilitator/test/verify-static.test.ts`: wrong amount, wrong destination, expired, replayed nonce, wrong asset, tampered signature. Review-round fixes are covered by `packages/*/test/r1-fixes.test.ts`; discovery abuse cases by `packages/discovery/test/security.test.ts`.
 
 ## Layout
 
@@ -91,4 +100,4 @@ SECURITY.md              threat model (STRIDE) and reporting
 
 ## Not in this repository
 
-No mainnet configuration beyond the network passphrase, no token issuance of any kind, no bridge, no settlement contract, no hosted instance. Mainnet is a separate milestone with its own review.
+No mainnet configuration beyond the network passphrase, no bridge, no settlement contract, no hosted instance. The only asset this repo issues is the valueless testnet demo asset `TUSDC`, created by `npm run demo:testnet` from a throwaway issuer so the automated demo can run without the manual Circle faucet; nothing here issues a production or value-bearing token. Mainnet is a separate milestone with its own review.

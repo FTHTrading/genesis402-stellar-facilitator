@@ -18,7 +18,8 @@ Labels: **REAL** = runs on Stellar testnet from this repo; **TESTED** = unit tes
 | Discovery index + JSON schema; crawl manifests; list only after a real 402; `GET /discovery/resources?network=` | `packages/discovery` | **TESTED**; **NOT DEPLOYED** |
 | Reference seller and payer proving an end-to-end paid call on testnet | `examples/` | **REAL** (see the demo transcript in the T1 report) |
 | Testnet USDC | Circle testnet USDC contract `CBIELTK6…DAMA` supported and verified on Horizon; the automated demo issues `TUSDC` because Circle's faucet is a manual form | Circle USDC path: configured, **not exercised by the automated demo**; `TUSDC`: **DEMO** |
-| Tests: ≥25 vitest tests incl. six negative cases; testnet integration behind an env flag; crawler test with a mock seller; CI | 80 unit tests, 1 opt-in integration test, `.github/workflows/ci.yml` | **TESTED**; CI state is in the T1 report |
+| Tests: ≥25 vitest tests incl. six negative cases; testnet integration behind an env flag; crawler test with a mock seller; CI | 84 unit tests at the r1 review baseline (52b2e34), 122 at HEAD, plus 1 opt-in integration test, `.github/workflows/ci.yml` | **TESTED**; CI state is in the T1 report |
+| Review round r1 (failure-path reviewer, 2026-10-23): 6 Important + 10 Minor findings | all fixed test-first except one reviewer test that contradicts the replay rule (see T1 report, "Fixes r1") | **TESTED** |
 | Docs: README, ARCHITECTURE.md (Mermaid), SECURITY.md (STRIDE), this file | repo root, `docs/` | written |
 
 Out of T1 scope and **ABSENT** here: Soroban settlement contract, mainnet, token issuance, any bridge, marketing copy.
@@ -37,6 +38,6 @@ Count of settled x402 payments on Stellar through this facilitator (transaction 
 
 ## Honesty notes
 
-- The demo asset `TUSDC` has no value and is re-issued per run. Replace it with Circle testnet USDC by funding the payer at faucet.circle.com; the code path is identical.
+- The demo issues an asset: `TUSDC`, from a throwaway testnet issuer, per run. It has no value and exists only because Circle's testnet faucet is a manual form. No other token is issued anywhere in this project. Replace it with Circle testnet USDC by funding the payer at faucet.circle.com; the code path is identical.
 - "Bazaar-style" means the manifest and index use the same field pattern as the Coinbase x402 Bazaar (resource, price, lane, schema). This index is not operated by Coinbase and is not listed there.
 - Hosted Stellar x402 facilitators exist (OpenZeppelin Relayer plugin, Vellar). This project's distinct parts are the self-hostable facilitator with a tested verifier, the chain-aware discovery index with a live-402 listing rule, and the seller catalogue that gives it day-one content.
