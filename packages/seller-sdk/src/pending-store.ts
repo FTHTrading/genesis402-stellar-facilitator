@@ -22,24 +22,41 @@ export interface PendingRecord {
   expiresAt: number;
 }
 
+/** Thrown by `withLock` when another holder keeps the digest busy for longer than the wait bound. */
+export class PendingStoreBusyError extends Error {
+  readonly code = "pending_store_busy" as const;
+  constructor(message = "another request holds this payment") {
+    super(message);
+    this.name = "PendingStoreBusyError";
+  }
+}
+
 /**
  * Durable, shareable memory of in-progress payments. `withLock` serializes all
- * work on one payment digest, across every seller instance that shares the
- * store; that serialization is what makes "one payment, one delivery" hold
- * across a seller restart or a fleet.
+ * work on one payment digest across every seller instance that shares the
+ * store. Delivery itself is gated by `consume`: an atomic "delete the record
+ * if it still carries this claim key" that can succeed for exactly one caller,
+ * so even a lock that expired under a slow request cannot produce two
+ * deliveries.
  */
 export interface PendingStore {
   withLock<T>(digest: string, fn: () => Promise<T>): Promise<T>;
   get(digest: string): Promise<PendingRecord | undefined>;
   put(record: PendingRecord): Promise<void>;
   delete(digest: string): Promise<void>;
+  /** Atomically removes the record iff it still carries `claimKey`; true exactly once. */
+  consume(digest: string, claimKey: string): Promise<boolean>;
 }
 
-/** Default: one process, one instance. Lost on restart; pass a shared store to survive one. */
+/**
+ * Default: one process, one instance. Lost on restart; pass a shared store to
+ * survive one. Live records (`inflight`, `pending`) are never evicted; when the
+ * bound is reached, the oldest tombstones go first.
+ */
 export class InMemoryPendingStore implements PendingStore {
   private readonly records = new Map<string, PendingRecord>();
   private readonly locks = new Map<string, Promise<unknown>>();
-  constructor(private readonly maxRecords = 1000) {}
+  constructor(private readonly maxTombstones = 1000) {}
 
   async withLock<T>(digest: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(digest) ?? Promise.resolve();
@@ -56,45 +73,70 @@ export class InMemoryPendingStore implements PendingStore {
     return this.records.get(digest);
   }
   async put(record: PendingRecord): Promise<void> {
-    if (!this.records.has(record.digest) && this.records.size >= this.maxRecords) {
-      const oldest = this.records.keys().next().value;
-      if (oldest) this.records.delete(oldest);
-    }
     this.records.set(record.digest, record);
+    let tombstones = 0;
+    for (const r of this.records.values()) if (r.state === "expired") tombstones++;
+    if (tombstones > this.maxTombstones) {
+      const oldest = [...this.records.values()].filter((r) => r.state === "expired").sort((a, b) => a.expiresAt - b.expiresAt);
+      for (const r of oldest.slice(0, tombstones - this.maxTombstones)) this.records.delete(r.digest);
+    }
   }
   async delete(digest: string): Promise<void> {
     this.records.delete(digest);
   }
+  async consume(digest: string, claimKey: string): Promise<boolean> {
+    const rec = this.records.get(digest);
+    if (!rec || rec.claimKey !== claimKey) return false;
+    this.records.delete(digest);
+    return true;
+  }
 }
 
 export interface SqlitePendingStoreOptions {
-  /** A lock older than this is considered abandoned (process died) and can be taken over. Default 30 s. */
+  /** Lease length for a lock; renewed every third of it while the holder runs. Default 30 s. */
   leaseMs?: number;
   /** Poll interval while waiting for a lock. Default 15 ms. */
   pollMs?: number;
+  /** How long a caller waits for a busy digest before `PendingStoreBusyError`. Default 15 s. */
+  lockWaitMs?: number;
+  /** Tombstones older than this past their expiry are swept on each lock. Default 24 h. */
+  tombstoneRetentionMs?: number;
+  /** At most this many tombstones are kept; the oldest beyond it are swept. Default 10,000. */
+  maxTombstones?: number;
   busyTimeoutMs?: number;
 }
 
 /**
  * SQLite-backed store usable from several seller processes on one host (or a
  * shared volume). Locks are leases in a table, taken with a single atomic
- * UPDATE, so two processes retrying the same payment take turns.
+ * UPDATE and renewed while the holder runs, so a slow request keeps its lock
+ * and a dead process frees it after one lease. Ownership is irrelevant to
+ * correctness of delivery: `consume` is the atomic gate.
  */
 export class SqlitePendingStore implements PendingStore {
   private readonly db: DatabaseSync;
   private readonly leaseMs: number;
   private readonly pollMs: number;
+  private readonly lockWaitMs: number;
+  private readonly retentionMs: number;
+  private readonly maxTombstones: number;
 
   constructor(path: string, opts: SqlitePendingStoreOptions = {}) {
     this.db = new DatabaseSync(path);
-    this.leaseMs = opts.leaseMs ?? 30_000;
+    this.leaseMs = Math.max(50, opts.leaseMs ?? 30_000);
     this.pollMs = opts.pollMs ?? 15;
+    this.lockWaitMs = opts.lockWaitMs ?? 15_000;
+    this.retentionMs = opts.tombstoneRetentionMs ?? 24 * 3_600_000;
+    this.maxTombstones = opts.maxTombstones ?? 10_000;
     this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(opts.busyTimeoutMs ?? 2000))}`);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS pending_payments (
         digest TEXT PRIMARY KEY,
         record TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        claim_key TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT 'pending',
+        expires_at INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS pending_locks (
         digest TEXT PRIMARY KEY,
@@ -102,6 +144,21 @@ export class SqlitePendingStore implements PendingStore {
         leased_until INTEGER NOT NULL
       );
     `);
+    // Upgrade a pre-r4 file. Several processes may open the same file at once; a column another
+    // process just added is not an error.
+    for (const [col, ddl] of [
+      ["claim_key", "ALTER TABLE pending_payments ADD COLUMN claim_key TEXT NOT NULL DEFAULT ''"],
+      ["state", "ALTER TABLE pending_payments ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'"],
+      ["expires_at", "ALTER TABLE pending_payments ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0"],
+    ] as const) {
+      const cols = (this.db.prepare("PRAGMA table_info(pending_payments)").all() as Array<{ name: string }>).map((c) => c.name);
+      if (cols.includes(col)) continue;
+      try {
+        this.db.exec(ddl);
+      } catch (err) {
+        if (!/duplicate column/i.test(String((err as Error).message))) throw err;
+      }
+    }
   }
 
   async withLock<T>(digest: string, fn: () => Promise<T>): Promise<T> {
@@ -111,17 +168,29 @@ export class SqlitePendingStore implements PendingStore {
        ON CONFLICT(digest) DO UPDATE SET owner = excluded.owner, leased_until = excluded.leased_until
        WHERE pending_locks.leased_until < ?`,
     );
-    const deadline = Date.now() + this.leaseMs * 2;
+    const deadline = Date.now() + this.lockWaitMs;
     for (;;) {
       const now = Date.now();
       const r = acquire.run(digest, owner, now + this.leaseMs, now);
       if (r.changes === 1) break;
-      if (Date.now() > deadline) throw new Error("pending store lock wait exceeded");
+      if (Date.now() > deadline) throw new PendingStoreBusyError();
       await new Promise((res) => setTimeout(res, this.pollMs));
     }
+    // Renew while the holder runs, so a slow request is not taken over by another instance.
+    const renew = this.db.prepare("UPDATE pending_locks SET leased_until = ? WHERE digest = ? AND owner = ?");
+    const timer = setInterval(() => {
+      try {
+        renew.run(Date.now() + this.leaseMs, digest, owner);
+      } catch {
+        /* a failed renewal only shortens the lease; delivery is still gated by consume() */
+      }
+    }, Math.max(10, Math.floor(this.leaseMs / 3)));
+    timer.unref?.();
     try {
+      this.sweep();
       return await fn();
     } finally {
+      clearInterval(timer);
       this.db.prepare("DELETE FROM pending_locks WHERE digest = ? AND owner = ?").run(digest, owner);
     }
   }
@@ -134,14 +203,31 @@ export class SqlitePendingStore implements PendingStore {
   async put(record: PendingRecord): Promise<void> {
     this.db
       .prepare(
-        `INSERT INTO pending_payments (digest, record, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(digest) DO UPDATE SET record = excluded.record, updated_at = excluded.updated_at`,
+        `INSERT INTO pending_payments (digest, record, updated_at, claim_key, state, expires_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(digest) DO UPDATE SET record = excluded.record, updated_at = excluded.updated_at,
+           claim_key = excluded.claim_key, state = excluded.state, expires_at = excluded.expires_at`,
       )
-      .run(record.digest, JSON.stringify(record), Date.now());
+      .run(record.digest, JSON.stringify(record), Date.now(), record.claimKey, record.state, record.expiresAt);
   }
 
   async delete(digest: string): Promise<void> {
     this.db.prepare("DELETE FROM pending_payments WHERE digest = ?").run(digest);
+  }
+
+  async consume(digest: string, claimKey: string): Promise<boolean> {
+    const r = this.db.prepare("DELETE FROM pending_payments WHERE digest = ? AND claim_key = ?").run(digest, claimKey);
+    return r.changes === 1;
+  }
+
+  /** Tombstone hygiene: drop expired records past retention and keep the newest `maxTombstones`. Live records are never touched. */
+  sweep(now = Date.now()): void {
+    this.db.prepare("DELETE FROM pending_payments WHERE state = 'expired' AND expires_at < ?").run(now - this.retentionMs);
+    this.db
+      .prepare(
+        `DELETE FROM pending_payments WHERE state = 'expired' AND digest IN (
+           SELECT digest FROM pending_payments WHERE state = 'expired' ORDER BY expires_at DESC LIMIT -1 OFFSET ?)`,
+      )
+      .run(this.maxTombstones);
   }
 
   close(): void {

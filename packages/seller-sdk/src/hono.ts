@@ -38,6 +38,9 @@ export function honoPaywall(paywall: Paywall, opts: HonoPaywallOptions): Middlew
     if (result.kind === "settlement_pending") {
       return c.json(result.body, 409, result.headers);
     }
+    if (result.kind === "busy") {
+      return c.json(result.body, 503, result.headers);
+    }
     c.set("x402Settlement", result.settlement);
     c.set("x402Payer", result.payer);
     await next();

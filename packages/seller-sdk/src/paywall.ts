@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { InMemoryPendingStore, type PendingRecord, type PendingStore } from "./pending-store.js";
+import { InMemoryPendingStore, PendingStoreBusyError, type PendingRecord, type PendingStore } from "./pending-store.js";
 import {
   HEADER_PAYMENT_LEGACY,
   HEADER_PAYMENT_REQUIRED,
@@ -52,6 +52,8 @@ export interface PaywallConfig {
   confirm?: (hash: string) => Promise<ChainStatus>;
   confirmAttempts?: number;
   confirmDelayMs?: number;
+  /** Upper bound for one inclusion check, so a slow Horizon cannot hold a payment's lock. Default 5 s. */
+  confirmTimeoutMs?: number;
   /**
    * Extra seconds a `settlement_pending` record stays retryable after the
    * payment's own validity (`maxTimeoutSeconds` for the envelope time bounds
@@ -88,6 +90,7 @@ export interface SettlementPendingBody {
 export type HandleResult =
   | { kind: "payment_required"; status: 402; headers: Record<string, string>; body: PaymentRequired }
   | { kind: "settlement_pending"; status: 409; headers: Record<string, string>; body: SettlementPendingBody }
+  | { kind: "busy"; status: 503; headers: Record<string, string>; body: { error: "settlement_busy"; retry: string } }
   | { kind: "paid"; headers: Record<string, string>; settlement: SettleResponse; payer: string | undefined };
 
 export interface Paywall {
@@ -134,6 +137,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
   const horizonUrl = (cfg.horizonUrl ?? DEFAULT_HORIZON[cfg.network] ?? "").replace(/\/$/, "");
   const confirmAttempts = cfg.confirmAttempts ?? 3;
   const confirmDelayMs = cfg.confirmDelayMs ?? 1500;
+  const confirmTimeoutMs = cfg.confirmTimeoutMs ?? 5000;
   const confirm = cfg.confirm ?? ((hash: string) => horizonStatus(fetchImpl, horizonUrl, hash));
   const graceMs = (cfg.pendingGraceSeconds ?? 30) * 1000;
   const store: PendingStore = cfg.pendingStore ?? new InMemoryPendingStore();
@@ -198,12 +202,21 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     amount: req.amount,
   });
 
-  const paidResult = (settlement: SettleResponse, payer: string | undefined): HandleResult => ({
-    kind: "paid",
-    headers: { [HEADER_PAYMENT_RESPONSE]: encodeHeader(settlement) },
-    settlement,
-    payer,
-  });
+  /**
+   * The only way out as `paid`: the record is consumed atomically under its claim key. If another
+   * holder (an instance that took over an expired lease) consumed it first, this caller answers
+   * 409 and the buyer re-sends; one payment can never produce two deliveries.
+   */
+  const deliver = async (
+    rec: PendingRecord,
+    resource: ResourceInfo,
+    settlement: SettleResponse,
+    payer: string | undefined,
+  ): Promise<HandleResult> => {
+    const mine = await store.consume(rec.digest, rec.claimKey);
+    if (!mine) return pendingAnswer(resource, rec.requirements, settlement.transaction || rec.txHash);
+    return { kind: "paid", headers: { [HEADER_PAYMENT_RESPONSE]: encodeHeader(settlement) }, settlement, payer };
+  };
 
   async function callFacilitator<T>(
     path: "/verify" | "/settle",
@@ -240,7 +253,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     for (let i = 0; i < confirmAttempts; i++) {
       let status: ChainStatus = "UNKNOWN";
       try {
-        status = await confirm(hash);
+        status = await withTimeout(confirm(hash), confirmTimeoutMs, "UNKNOWN" as ChainStatus);
       } catch {
         status = "UNKNOWN";
       }
@@ -273,10 +286,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
       return keep();
     }
     const settle = call.value;
-    if (settle.success) {
-      await store.delete(rec.digest);
-      return paidResult(settle, settle.payer ?? payer);
-    }
+    if (settle.success) return deliver(rec, resource, settle, settle.payer ?? payer);
     const reason = settle.errorReason ?? "settlement_failed";
     // Someone else's claim. Never a delivery, whatever the chain says.
     if (reason === "invalid_exact_stellar_payload_nonce_reused") {
@@ -294,10 +304,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
       return deny(price, resource, reason, method);
     }
     const status = await confirmed(hash);
-    if (status === "SUCCESS") {
-      await store.delete(rec.digest);
-      return paidResult(receipt(hash, req, settle.payer ?? payer), settle.payer ?? payer);
-    }
+    if (status === "SUCCESS") return deliver(rec, resource, receipt(hash, req, settle.payer ?? payer), settle.payer ?? payer);
     if (status === "FAILED") {
       await store.delete(rec.digest);
       return deny(price, resource, "settle_exact_stellar_transaction_failed", method);
@@ -313,10 +320,7 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
     }
     if (rec.txHash) {
       const status = await confirmed(rec.txHash);
-      if (status === "SUCCESS") {
-        await store.delete(rec.digest);
-        return paidResult(receipt(rec.txHash, rec.requirements, undefined), undefined);
-      }
+      if (status === "SUCCESS") return deliver(rec, resource, receipt(rec.txHash, rec.requirements, undefined), undefined);
       if (status === "FAILED") {
         await store.delete(rec.digest);
         return deny(price, resource, "settle_exact_stellar_transaction_failed", method);
@@ -391,9 +395,37 @@ export function createPaywall(cfg: PaywallConfig): Paywall {
       const raw = input.headers.get(HEADER_PAYMENT_SIGNATURE) ?? input.headers.get(HEADER_PAYMENT_LEGACY);
       if (!raw) return deny(input.price, input.resource, "payment_required", method);
       const digest = createHash("sha256").update(raw).digest("hex");
-      return store.withLock(digest, () => handleLocked(digest, raw, input));
+      try {
+        return await store.withLock(digest, () => handleLocked(digest, raw, input));
+      } catch (err) {
+        if (err instanceof PendingStoreBusyError) {
+          return {
+            kind: "busy",
+            status: 503,
+            headers: { "content-type": "application/json", "retry-after": "5" },
+            body: { error: "settlement_busy", retry: "Another request for this payment is in progress. Re-send the same PAYMENT-SIGNATURE shortly." },
+          };
+        }
+        throw err;
+      }
     },
   };
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const t = setTimeout(() => resolve(fallback), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(t);
+        resolve(fallback);
+      },
+    );
+  });
 }
 
 /** `origin + pathname` of a URL; query strings and fragments do not identify a resource. */
