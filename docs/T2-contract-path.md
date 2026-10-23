@@ -1,6 +1,6 @@
 # T2: moving `/settle` from a direct token transfer to the `x402-settle` contract
 
-State: the contract is **TESTED on testnet** (`CAGID4DCA5IY7REZYHJWSTHU3BPE5VABPTRW3ASMNW3U7JK2XTTLE2MQ`, see `contracts/x402-settle/DEPLOY-TESTNET.md`), **NOT DEPLOYED to mainnet**, and **not yet wired** to `packages/facilitator`. This note is the design for the wiring; it changes no code under `packages/`.
+State: the contract is **TESTED on testnet** (`CDWAJIUNSSVZFLN5FIJ3IHFHABILGEVGNYPYQMQLHFLET7JVJPXLPTHD`, see `contracts/x402-settle/DEPLOY-TESTNET.md`), **NOT DEPLOYED to mainnet**, and **not yet wired** to `packages/facilitator`. This note is the design for the wiring; it changes no code under `packages/`.
 
 ## What changes in the payload
 

@@ -2,7 +2,7 @@
 
 Soroban settlement contract for x402 `exact` payments on Stellar.
 
-State: **TESTED on testnet** (`CAGID4DCA5IY7REZYHJWSTHU3BPE5VABPTRW3ASMNW3U7JK2XTTLE2MQ`, see `DEPLOY-TESTNET.md`). **NOT DEPLOYED to mainnet.** **Not yet wired** to the facilitator in `packages/facilitator`; the switch is designed in `../../docs/T2-contract-path.md`.
+State: **TESTED on testnet** (`CDWAJIUNSSVZFLN5FIJ3IHFHABILGEVGNYPYQMQLHFLET7JVJPXLPTHD`, see `DEPLOY-TESTNET.md`). **NOT DEPLOYED to mainnet.** **Not yet wired** to the facilitator in `packages/facilitator`; the switch is designed in `../../docs/T2-contract-path.md`.
 
 ## Interface
 
