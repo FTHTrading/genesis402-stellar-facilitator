@@ -19,6 +19,7 @@ import {
   isStellarNetwork,
   passphraseFor,
 } from "./constants.js";
+import { withRetry } from "./retry.js";
 import type { PaymentPayload, PaymentRequirements, ResourceInfo } from "./types.js";
 
 /** Anything that can produce an Ed25519 signature for the payer (a Keypair, or a remote signer). */
@@ -136,7 +137,7 @@ export async function createPaymentPayload(opts: CreatePaymentOptions): Promise<
   if (req.extra?.["areFeesSponsored"] !== true) {
     throw new Error("Stellar exact scheme requires extra.areFeesSponsored === true");
   }
-  const latest = await opts.rpc.getLatestLedger();
+  const latest = await withRetry(() => opts.rpc.getLatestLedger());
   const ledgerSeconds = opts.estimatedLedgerSeconds ?? DEFAULT_ESTIMATED_LEDGER_SECONDS;
   const validUntilLedgerSeq = latest.sequence + Math.ceil(req.maxTimeoutSeconds / ledgerSeconds);
   const transaction = await buildPaymentTransactionOffline({

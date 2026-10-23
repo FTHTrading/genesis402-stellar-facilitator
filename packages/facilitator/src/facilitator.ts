@@ -159,6 +159,8 @@ export class StellarFacilitator {
         amount: requirements.amount,
       };
     } catch (err) {
+      // Operators need the cause; clients only get the fixed reason plus a short message.
+      console.error(`[facilitator] settle failed for ${p.payer}:`, err);
       return failed("unexpected_settle_error", txHash, (err as Error).message);
     }
   }

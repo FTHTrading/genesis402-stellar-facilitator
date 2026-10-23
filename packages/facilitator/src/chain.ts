@@ -1,11 +1,11 @@
 import {
+  Account,
   Address,
   Horizon,
   StrKey,
   rpc,
   scValToNative,
   xdr,
-  type Account,
   type Transaction,
 } from "@stellar/stellar-sdk";
 import {
@@ -13,6 +13,7 @@ import {
   DEFAULT_HORIZON_URLS,
   DEFAULT_RPC_URLS,
 } from "./constants.js";
+import { isTransientError, withRetry } from "./retry.js";
 
 /** One SEP-41 `transfer` event observed in simulation (CAP-46-6: topics [transfer, from, to], data amount). */
 export interface TransferEvent {
@@ -106,7 +107,7 @@ export class RpcChainClient implements ChainClient {
   }
 
   async getLatestLedger(): Promise<number> {
-    return (await this.server.getLatestLedger()).sequence;
+    return (await withRetry(() => this.server.getLatestLedger())).sequence;
   }
 
   /** Average close time over the last 20 ledgers (Horizon), falling back to 5 seconds. */
@@ -124,12 +125,22 @@ export class RpcChainClient implements ChainClient {
     }
   }
 
-  getAccount(address: string): Promise<Account> {
-    return this.server.getAccount(address);
+  /** Sequence number via RPC, falling back to Horizon when the RPC is unavailable or lagging. */
+  async getAccount(address: string): Promise<Account> {
+    try {
+      return await withRetry(() => this.server.getAccount(address), { attempts: 2 });
+    } catch (rpcErr) {
+      try {
+        const acc = await withRetry(() => this.horizon.loadAccount(address));
+        return new Account(acc.account_id, acc.sequence);
+      } catch {
+        throw rpcErr;
+      }
+    }
   }
 
   async simulate(tx: Transaction): Promise<SimulationResult> {
-    const sim = await this.server.simulateTransaction(tx);
+    const sim = await withRetry(() => this.server.simulateTransaction(tx));
     if (rpc.Api.isSimulationError(sim)) return { ok: false, error: sim.error };
     if (rpc.Api.isSimulationRestore(sim)) {
       return { ok: false, error: "ledger entries need restoration before this transfer can run" };
@@ -142,8 +153,14 @@ export class RpcChainClient implements ChainClient {
     };
   }
 
+  /**
+   * sendTransaction is idempotent for a given envelope (same hash), so a
+   * transport failure is retried; a repeat that the node already holds comes
+   * back as DUPLICATE and is treated as pending.
+   */
   async send(tx: Transaction): Promise<{ status: string; hash: string; error?: string }> {
-    const res = await this.server.sendTransaction(tx);
+    const res = await withRetry(() => this.server.sendTransaction(tx));
+    if (res.status === "DUPLICATE") return { status: "PENDING", hash: res.hash };
     const error =
       res.status === "ERROR"
         ? `sendTransaction ERROR: ${res.errorResult ? res.errorResult.toXDR("base64") : "no result"}`
@@ -157,8 +174,11 @@ export class RpcChainClient implements ChainClient {
     const deadline = Date.now() + Math.max(timeoutSeconds, 10) * 1000;
     let status = "NOT_FOUND";
     while (Date.now() < deadline) {
-      const res = await this.server.getTransaction(hash);
-      status = res.status;
+      try {
+        status = (await this.server.getTransaction(hash)).status;
+      } catch (err) {
+        if (!isTransientError(err)) throw err;
+      }
       if (status === "SUCCESS" || status === "FAILED") return { status };
       await new Promise((r) => setTimeout(r, 1000));
     }

@@ -7,7 +7,7 @@ import {
   TransactionBuilder,
   rpc,
 } from "@stellar/stellar-sdk";
-import { FRIENDBOT_URL } from "@genesis402/stellar-facilitator";
+import { FRIENDBOT_URL, withRetry } from "@genesis402/stellar-facilitator";
 
 export interface TestnetContext {
   server: rpc.Server;
@@ -18,18 +18,39 @@ export interface TestnetContext {
 
 /** Funds an account with friendbot unless it already exists. */
 export async function ensureFunded(ctx: TestnetContext, publicKey: string, label: string): Promise<void> {
-  try {
-    await ctx.server.getAccount(publicKey);
+  const notFound = (err: unknown) => /not found|404/i.test(String((err as Error).message));
+  const exists = async (): Promise<boolean> => {
+    // Horizon first (separate infrastructure from Soroban RPC), then RPC; a 404 from either is definitive.
+    const probes: Array<() => Promise<unknown>> = [
+      () => ctx.horizon.loadAccount(publicKey),
+      () => ctx.server.getAccount(publicKey),
+    ];
+    for (const probe of probes) {
+      try {
+        await withRetry(probe, { isTransient: (err) => !notFound(err), attempts: 3 });
+        return true;
+      } catch (err) {
+        if (notFound(err)) return false;
+      }
+    }
+    throw new Error(`${label}: neither Horizon nor RPC could answer whether ${publicKey} exists`);
+  };
+  if (await exists()) {
     ctx.log(`${label} ${publicKey} already funded`);
     return;
-  } catch {
-    /* not found: fund it */
   }
-  const res = await fetch(`${FRIENDBOT_URL}?addr=${encodeURIComponent(publicKey)}`);
-  if (!res.ok && res.status !== 400) {
-    throw new Error(`friendbot failed for ${label}: HTTP ${res.status} ${await res.text()}`);
-  }
-  await ctx.server.getAccount(publicKey);
+  await withRetry(
+    async () => {
+      const res = await fetch(`${FRIENDBOT_URL}?addr=${encodeURIComponent(publicKey)}`);
+      if (res.ok || res.status === 400) return; // 400 = already funded
+      const text = await res.text();
+      throw Object.assign(new Error(`friendbot HTTP ${res.status} for ${label}: ${text.slice(0, 120)}`), {
+        response: { status: res.status },
+      });
+    },
+    { attempts: 5, baseMs: 1000 },
+  );
+  if (!(await exists())) throw new Error(`${label} ${publicKey} still missing after friendbot`);
   ctx.log(`${label} ${publicKey} funded by friendbot`);
 }
 
@@ -87,14 +108,15 @@ export async function issueDemoAsset(
 }
 
 async function deploySac(ctx: TestnetContext, source: Keypair, asset: Asset, contract: string): Promise<void> {
-  const account = await ctx.server.getAccount(source.publicKey());
+  // Sequence from Horizon: separate infrastructure from the Soroban RPC, which has been flaky.
+  const account = await withRetry(() => ctx.horizon.loadAccount(source.publicKey()));
   const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: ctx.networkPassphrase })
     .addOperation(Operation.createStellarAssetContract({ asset }))
     .setTimeout(60)
     .build();
   let prepared;
   try {
-    prepared = await ctx.server.prepareTransaction(tx);
+    prepared = await withRetry(() => ctx.server.prepareTransaction(tx));
   } catch (err) {
     const msg = (err as Error).message;
     if (/ExistingValue|already exists|instance already/i.test(msg)) {
@@ -104,9 +126,11 @@ async function deploySac(ctx: TestnetContext, source: Keypair, asset: Asset, con
     throw err;
   }
   prepared.sign(source);
-  const sent = await ctx.server.sendTransaction(prepared);
-  if (sent.status !== "PENDING") throw new Error(`SAC deploy rejected: ${sent.status}`);
-  const final = await ctx.server.pollTransaction(sent.hash, { attempts: 30 });
+  const sent = await withRetry(() => ctx.server.sendTransaction(prepared));
+  if (sent.status !== "PENDING" && sent.status !== "DUPLICATE") {
+    throw new Error(`SAC deploy rejected: ${sent.status}`);
+  }
+  const final = await withRetry(() => ctx.server.pollTransaction(sent.hash, { attempts: 30 }));
   if (final.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
     throw new Error(`SAC deploy ${final.status}: ${sent.hash}`);
   }
