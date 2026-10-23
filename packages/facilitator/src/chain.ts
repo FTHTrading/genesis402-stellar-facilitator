@@ -108,6 +108,7 @@ export class RpcChainClient implements ChainClient {
     if (!horizonUrl) throw new Error(`No Horizon URL for ${opts.network}; set STELLAR_HORIZON_URL`);
     const timeout = opts.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
     this.server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://"), timeout });
+    this.server.httpClient.defaults.timeout = timeout;
     this.horizon = new Horizon.Server(horizonUrl, { allowHttp: horizonUrl.startsWith("http://") });
     this.horizon.httpClient.defaults.timeout = timeout;
   }
@@ -163,17 +164,38 @@ export class RpcChainClient implements ChainClient {
    * sendTransaction is idempotent for a given envelope (same hash), so a
    * transport failure is retried; a repeat that the node already holds comes
    * back as DUPLICATE and is treated as pending.
+   *
+   * Once any attempt has failed at the transport level, the envelope may have
+   * been admitted by that attempt (the answer was lost). A later `ERROR` such as
+   * `txBAD_SEQ`, or `TRY_AGAIN_LATER`, is then no proof of non-admission and is
+   * reported as `AMBIGUOUS` so the caller keeps its claim and returns the hash.
    */
   async send(tx: Transaction): Promise<{ status: string; hash: string; error?: string }> {
-    const res = await withRetry(() => this.server.sendTransaction(tx));
-    if (res.status === "DUPLICATE") return { status: "PENDING", hash: res.hash };
-    const error =
-      res.status === "ERROR"
-        ? `sendTransaction ERROR: ${res.errorResult ? res.errorResult.toXDR("base64") : "no result"}`
-        : res.status !== "PENDING"
-          ? `sendTransaction ${res.status}`
-          : undefined;
-    return { status: res.status, hash: res.hash, ...(error ? { error } : {}) };
+    const localHash = Buffer.from(tx.hash()).toString("hex");
+    const attempts = 4;
+    let transportFailed = false;
+    let lastErr: unknown;
+    for (let i = 0; i < attempts; i++) {
+      let res;
+      try {
+        res = await this.server.sendTransaction(tx);
+      } catch (err) {
+        lastErr = err;
+        if (!isTransientError(err)) throw err;
+        transportFailed = true;
+        if (i < attempts - 1) await new Promise((r) => setTimeout(r, 500 * 2 ** i));
+        continue;
+      }
+      const hash = res.hash || localHash;
+      if (res.status === "PENDING" || res.status === "DUPLICATE") return { status: "PENDING", hash };
+      const error =
+        res.status === "ERROR"
+          ? `sendTransaction ERROR: ${res.errorResult ? res.errorResult.toXDR("base64") : "no result"}`
+          : `sendTransaction ${res.status}`;
+      if (transportFailed) return { status: "AMBIGUOUS", hash, error: `${error} (after a lost attempt)` };
+      return { status: res.status, hash, error };
+    }
+    throw lastErr;
   }
 
   async waitForTransaction(hash: string, timeoutSeconds: number): Promise<{ status: string }> {

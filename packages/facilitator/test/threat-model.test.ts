@@ -16,7 +16,7 @@ describe("DoS.6 fee-drain guard", () => {
   it("refuses settlement once the hour's fee budget would be exceeded; the budget refills as the window slides", async () => {
     let t = 1_700_000_000_000;
     // Each settlement costs 1000 + 100 stroops; budget allows two.
-    const { chain, f } = mk({ feeBudgetStroopsPerHour: 2_300, now: () => t });
+    const { chain, f } = mk({ feeBudgetStroopsPerHour: 2_300, feeBudgetPerSellerStroopsPerHour: 2_300, now: () => t });
     const req = requirements();
     expect((await f.settle(await signedPayload(req, { payerKp: Keypair.random() }), req)).success).toBe(true);
     expect((await f.settle(await signedPayload(req, { payerKp: Keypair.random() }), req)).success).toBe(true);

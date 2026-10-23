@@ -18,9 +18,12 @@ import { SqliteNonceStore } from "./nonce-store.js";
  *   NONCE_DB_PATH              SQLite file for consumed nonces (default: ./facilitator-nonces.sqlite)
  *   MAX_TRANSACTION_FEE_STROOPS  fee ceiling per settlement (default 50000)
  *   FEE_BUDGET_STROOPS_PER_HOUR  fee-drain guard: total fees sponsored per trailing hour (default 5000000)
+ *   FEE_BUDGET_PER_SELLER_STROOPS_PER_HOUR  one payTo's share of that hour (default: a quarter of the global budget)
  *   MAX_SETTLES_PER_SELLER_PER_HOUR  per-payTo settlement cap (default 600)
  *   SELLER_TOKENS              comma-separated bearer tokens; set = sellers must authenticate, unset = open
  *   PORT                       default 4021
+ * Every numeric value must be a plain non-negative integer ("5000000", not "5,000,000" or "0.5 XLM");
+ * anything else refuses to start, the same way a bad allowlist does.
  */
 export function facilitatorFromEnv(env: NodeJS.ProcessEnv = process.env): StellarFacilitator {
   const network = env["STELLAR_NETWORK"] ?? STELLAR_TESTNET;
@@ -31,7 +34,6 @@ export function facilitatorFromEnv(env: NodeJS.ProcessEnv = process.env): Stella
     ...(env["STELLAR_RPC_URL"] ? { rpcUrl: env["STELLAR_RPC_URL"] } : {}),
     ...(env["STELLAR_HORIZON_URL"] ? { horizonUrl: env["STELLAR_HORIZON_URL"] } : {}),
   });
-  const maxFee = env["MAX_TRANSACTION_FEE_STROOPS"];
   // Fail closed: an ALLOWED_ASSETS that is set but names nothing is a misconfiguration, not "allow everything".
   const allowed = (env["ALLOWED_ASSETS"] ?? USDC_SAC[network] ?? "")
     .split(",")
@@ -39,18 +41,32 @@ export function facilitatorFromEnv(env: NodeJS.ProcessEnv = process.env): Stella
     .filter(Boolean);
   const demo = env["DEMO_ASSET"]?.trim();
   if (demo) allowed.push(demo);
-  const feeBudget = env["FEE_BUDGET_STROOPS_PER_HOUR"];
-  const sellerCap = env["MAX_SETTLES_PER_SELLER_PER_HOUR"];
+  const maxFee = envInt(env, "MAX_TRANSACTION_FEE_STROOPS");
+  const feeBudget = envInt(env, "FEE_BUDGET_STROOPS_PER_HOUR");
+  const perSeller = envInt(env, "FEE_BUDGET_PER_SELLER_STROOPS_PER_HOUR");
+  const sellerCap = envInt(env, "MAX_SETTLES_PER_SELLER_PER_HOUR");
   return new StellarFacilitator({
     network,
     signer: Keypair.fromSecret(secret),
     chain,
     nonceStore: new SqliteNonceStore(env["NONCE_DB_PATH"] ?? "./facilitator-nonces.sqlite"),
     allowedAssets: allowed,
-    ...(maxFee ? { maxTransactionFeeStroops: Number(maxFee) } : {}),
-    ...(feeBudget ? { feeBudgetStroopsPerHour: Number(feeBudget) } : {}),
-    ...(sellerCap ? { maxSettlesPerSellerPerHour: Number(sellerCap) } : {}),
+    ...(maxFee !== undefined ? { maxTransactionFeeStroops: maxFee } : {}),
+    ...(feeBudget !== undefined ? { feeBudgetStroopsPerHour: feeBudget } : {}),
+    ...(perSeller !== undefined ? { feeBudgetPerSellerStroopsPerHour: perSeller } : {}),
+    ...(sellerCap !== undefined ? { maxSettlesPerSellerPerHour: sellerCap } : {}),
   });
+}
+
+/** Strict non-negative integer from the environment; unset/blank = undefined; anything else throws. */
+export function envInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const v = raw.trim();
+  if (!/^\d{1,15}$/.test(v)) {
+    throw new Error(`${name} must be a plain non-negative integer (got "${v}")`);
+  }
+  return Number(v);
 }
 
 /** SELLER_TOKENS: comma-separated bearer tokens; empty or unset = open API (self-host default). */
@@ -67,7 +83,7 @@ try {
 if (process.argv[1] && import.meta.url === new URL("file:///" + process.argv[1].replace(/\\/g, "/").replace(/^\/+/, "")).href) {
   const facilitator = facilitatorFromEnv();
   const sellerTokens = sellerTokensFromEnv();
-  const port = Number(process.env["PORT"] ?? 4021);
+  const port = envInt(process.env, "PORT") ?? 4021;
   serve({ fetch: createApp(facilitator, { sellerTokens }).fetch, port }, (info) => {
     console.log(
       `genesis402-stellar-facilitator listening on http://localhost:${info.port} (${facilitator.network}, signer ${facilitator.address}, assets ${[...facilitator.allowedAssets].join(",")}, sellerAuth ${sellerTokens.length ? "bearer" : "open"})`,

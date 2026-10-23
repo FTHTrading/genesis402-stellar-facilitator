@@ -29,8 +29,13 @@ import { verifyStatic, type StaticResult } from "./verify.js";
 
 /** Upper bound on the time one settlement may hold the signer. Past it the lock is released and the result reported as ambiguous. */
 export const DEFAULT_SETTLE_DEADLINE_MS = 12_000;
+/** Fees the facilitator sponsors per trailing hour, all sellers together (0.5 XLM). */
+export const DEFAULT_FEE_BUDGET_STROOPS_PER_HOUR = 5_000_000;
+/** Settlements per `payTo` per trailing hour. */
+export const DEFAULT_MAX_SETTLES_PER_SELLER_PER_HOUR = 600;
 /** How long an idempotent re-read waits for a still-pending transaction before answering `not_confirmed`. */
 const REREAD_CONFIRM_SECONDS = 5;
+const HOUR_MS = 3_600_000;
 
 export interface FacilitatorOptions {
   /** CAIP-2 network this instance settles on, e.g. `stellar:testnet`. */
@@ -58,6 +63,16 @@ export interface FacilitatorOptions {
    * budget. Default 5,000,000 stroops (0.5 XLM).
    */
   feeBudgetStroopsPerHour?: number;
+  /**
+   * Fees one `payTo` may consume per trailing hour. Default: a quarter of the
+   * global budget, but never less than one maximum-fee settlement
+   * (`max(floor(budget / 4), maxTransactionFeeStroops)`), so a single seller —
+   * honest or hostile — can never take the hour from everyone else; it takes
+   * four distinct sellers acting together to exhaust the global budget. With
+   * the defaults (5,000,000 / 4 = 1,250,000) and the testnet demo fee of
+   * 16,860 stroops that is 74 settlements per seller per hour.
+   */
+  feeBudgetPerSellerStroopsPerHour?: number;
   /** Settlements accepted per `payTo` in the trailing hour. Default 600. */
   maxSettlesPerSellerPerHour?: number;
   now?: () => number;
@@ -78,7 +93,15 @@ type Static = Extract<StaticResult, { ok: true }>;
 type Invalid = { ok: false; reason: string; payer?: string; nonce?: string };
 type Prepared = { ok: true; rebuilt: Transaction; assemble: (tx: Transaction) => Transaction; feeStroops: number };
 
-const HOUR_MS = 3_600_000;
+/** Promise-chain mutex: one settlement at a time per facilitator account. */
+class Mutex {
+  private tail: Promise<unknown> = Promise.resolve();
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.tail.then(fn, fn);
+    this.tail = next.catch(() => undefined);
+    return next;
+  }
+}
 
 /** Sliding one-hour window of (timestamp, weight) entries. */
 class HourWindow {
@@ -94,14 +117,17 @@ class HourWindow {
   }
 }
 
-/** Promise-chain mutex: one settlement at a time per facilitator account. */
-class Mutex {
-  private tail: Promise<unknown> = Promise.resolve();
-  run<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.tail.then(fn, fn);
-    this.tail = next.catch(() => undefined);
-    return next;
-  }
+/**
+ * A guard value must be a non-negative safe integer. Anything else (NaN from
+ * `Number("5,000,000")`, a float, Infinity) fails closed to 0 — the guard then
+ * refuses everything rather than silently switching off. `server.ts` refuses
+ * to start on such input; this is the second line.
+ */
+function guardInt(value: number | undefined, fallback: number, name: string, log: (m: string) => void): number {
+  if (value === undefined) return fallback;
+  if (Number.isSafeInteger(value) && value >= 0) return value;
+  log(`${name} is not a non-negative integer (${String(value)}); failing closed to 0`);
+  return 0;
 }
 
 /**
@@ -127,9 +153,11 @@ export class StellarFacilitator {
   readonly inclusionFeeStroops: number;
   readonly settleDeadlineMs: number;
   readonly feeBudgetStroopsPerHour: number;
+  readonly feeBudgetPerSellerStroopsPerHour: number;
   readonly maxSettlesPerSellerPerHour: number;
   private readonly feeWindow: HourWindow;
-  private readonly sellerWindows = new Map<string, HourWindow>();
+  private readonly sellerCount = new Map<string, HourWindow>();
+  private readonly sellerFees = new Map<string, HourWindow>();
   private readonly now: () => number;
   private readonly chain: ChainClient;
   private readonly nonces: NonceStore;
@@ -145,6 +173,8 @@ export class StellarFacilitator {
     this.address = opts.signer.publicKey();
     this.chain = opts.chain;
     this.nonces = opts.nonceStore;
+    this.log = opts.log ?? ((m, e) => console.error(`[facilitator] ${m}`, e ?? ""));
+    const warn = (m: string) => this.log(m);
     const defaults = USDC_SAC[opts.network];
     const allowed = (opts.allowedAssets ?? (defaults ? [defaults] : [])).map((a) => a.trim()).filter(Boolean);
     if (allowed.length === 0) throw new Error("allowedAssets must name at least one token contract");
@@ -152,15 +182,21 @@ export class StellarFacilitator {
       if (!StrKey.isValidContract(a)) throw new Error(`allowedAssets entry is not a contract strkey: ${a}`);
     }
     this.allowedAssets = new Set(allowed);
-    this.maxTransactionFeeStroops = opts.maxTransactionFeeStroops ?? DEFAULT_MAX_TRANSACTION_FEE_STROOPS;
-    this.inclusionFeeStroops = opts.inclusionFeeStroops ?? DEFAULT_INCLUSION_FEE_STROOPS;
-    this.settleDeadlineMs = opts.settleDeadlineMs ?? DEFAULT_SETTLE_DEADLINE_MS;
-    this.feeBudgetStroopsPerHour = opts.feeBudgetStroopsPerHour ?? 5_000_000;
-    this.maxSettlesPerSellerPerHour = opts.maxSettlesPerSellerPerHour ?? 600;
+    this.maxTransactionFeeStroops = guardInt(opts.maxTransactionFeeStroops, DEFAULT_MAX_TRANSACTION_FEE_STROOPS, "maxTransactionFeeStroops", warn);
+    this.inclusionFeeStroops = guardInt(opts.inclusionFeeStroops, DEFAULT_INCLUSION_FEE_STROOPS, "inclusionFeeStroops", warn);
+    const deadline = opts.settleDeadlineMs;
+    this.settleDeadlineMs = deadline !== undefined && Number.isSafeInteger(deadline) && deadline > 0 ? deadline : DEFAULT_SETTLE_DEADLINE_MS;
+    this.feeBudgetStroopsPerHour = guardInt(opts.feeBudgetStroopsPerHour, DEFAULT_FEE_BUDGET_STROOPS_PER_HOUR, "feeBudgetStroopsPerHour", warn);
+    this.feeBudgetPerSellerStroopsPerHour = guardInt(
+      opts.feeBudgetPerSellerStroopsPerHour,
+      Math.max(Math.floor(this.feeBudgetStroopsPerHour / 4), this.maxTransactionFeeStroops),
+      "feeBudgetPerSellerStroopsPerHour",
+      warn,
+    );
+    this.maxSettlesPerSellerPerHour = guardInt(opts.maxSettlesPerSellerPerHour, DEFAULT_MAX_SETTLES_PER_SELLER_PER_HOUR, "maxSettlesPerSellerPerHour", warn);
     this.now = opts.now ?? (() => Date.now());
     this.feeWindow = new HourWindow(this.now);
     this.facilitatorAddresses = new Set([this.address]);
-    this.log = opts.log ?? ((m, e) => console.error(`[facilitator] ${m}`, e ?? ""));
   }
 
   supported(): SupportedResponse {
@@ -175,6 +211,15 @@ export class StellarFacilitator {
       ],
       extensions: [],
       signers: { "stellar:*": [this.address] },
+    };
+  }
+
+  /** Fees charged in the trailing hour (stroops) against the budgets; no per-seller detail is exposed. */
+  usage(): { feeStroopsLastHour: number; feeBudgetStroopsPerHour: number; feeBudgetPerSellerStroopsPerHour: number } {
+    return {
+      feeStroopsLastHour: this.feeWindow.total(),
+      feeBudgetStroopsPerHour: this.feeBudgetStroopsPerHour,
+      feeBudgetPerSellerStroopsPerHour: this.feeBudgetPerSellerStroopsPerHour,
     };
   }
 
@@ -213,9 +258,9 @@ export class StellarFacilitator {
   }
 
   /**
-   * The locked part: rebuild, simulate, claim, submit, confirm. Bounded by the
-   * deadline; when it fires the lock is released and the outcome reported from
-   * how far the section got. A claim made before the deadline is kept (the
+   * The locked part: rebuild, simulate, guards, claim, submit, confirm. Bounded
+   * by the deadline; when it fires the lock is released and the outcome reported
+   * from how far the section got. A claim made before the deadline is kept (the
    * envelope may have reached a node); a section that never claimed leaves the
    * buyer's entry untouched.
    */
@@ -246,13 +291,19 @@ export class StellarFacilitator {
       if (!p.ok) return failed(p.reason, s.payer);
       if (state.aborted) return failed("unexpected_settle_error", s.payer);
 
-      // Fee-drain guard: the hour's fee budget and the seller's hourly count, checked before any claim.
+      // Fee-drain guard, checked before any claim so a refused entry stays valid:
+      // global hourly budget, this seller's hourly fee share, this seller's hourly count.
       if (this.feeWindow.total() + p.feeStroops > this.feeBudgetStroopsPerHour) {
         this.log(`fee budget exhausted: ${this.feeWindow.total()} + ${p.feeStroops} > ${this.feeBudgetStroopsPerHour}`);
         return failed("fee_budget_exhausted", s.payer);
       }
-      const sellerWindow = this.sellerWindow(requirements.payTo);
-      if (sellerWindow.total() + 1 > this.maxSettlesPerSellerPerHour) {
+      const sellerFee = this.window(this.sellerFees, requirements.payTo);
+      if (sellerFee.total() + p.feeStroops > this.feeBudgetPerSellerStroopsPerHour) {
+        this.log(`seller fee share exhausted for ${requirements.payTo}`);
+        return failed("seller_fee_budget_exhausted", s.payer);
+      }
+      const sellerCount = this.window(this.sellerCount, requirements.payTo);
+      if (sellerCount.total() + 1 > this.maxSettlesPerSellerPerHour) {
         this.log(`seller cap reached for ${requirements.payTo}`);
         return failed("seller_rate_limited", s.payer);
       }
@@ -271,7 +322,7 @@ export class StellarFacilitator {
       // Claim the nonce right before submission; a concurrent settle of the same payload loses this race.
       let claimed: boolean;
       try {
-        claimed = this.nonces.consume(this.network, s.payer, s.nonce, hash, claimKey);
+        claimed = this.nonces.consume(this.network, s.payer, s.nonce, hash, claimKey, s.expirationLedger);
       } catch (err) {
         this.log("nonce store unavailable at claim", err);
         return failed("nonce_store_unavailable", s.payer);
@@ -281,7 +332,7 @@ export class StellarFacilitator {
       state.hash = hash;
       if (state.aborted) {
         // Deadline fired between claim and send: nothing was submitted, so the entry is unspent.
-        this.safeRelease(s);
+        this.safeRelease(s.payer, s.nonce);
         return failed("unexpected_settle_error", s.payer);
       }
 
@@ -294,9 +345,15 @@ export class StellarFacilitator {
         this.safeStatus(s, "submitted");
         return failed("unexpected_settle_error", s.payer, hash);
       }
+      if (sent.status === "AMBIGUOUS") {
+        // A lost attempt may have been admitted; the later answer proves nothing. Keep the claim, hand back the hash.
+        this.log(`sendTransaction ambiguous for ${hash}: ${sent.error ?? ""}`);
+        this.safeStatus(s, "submitted");
+        return failed("unexpected_settle_error", s.payer, hash);
+      }
       if (sent.status !== "PENDING") {
-        // ERROR and TRY_AGAIN_LATER mean the network did not admit this envelope: the entry is unspent.
-        if (sent.status === "ERROR" || sent.status === "TRY_AGAIN_LATER") this.safeRelease(s);
+        // ERROR and TRY_AGAIN_LATER on a clean attempt: the network did not admit this envelope; the entry is unspent.
+        if (sent.status === "ERROR" || sent.status === "TRY_AGAIN_LATER") this.safeRelease(s.payer, s.nonce);
         this.log(`sendTransaction ${sent.status} for ${hash}: ${sent.error ?? ""}`);
         return failed("settle_exact_stellar_transaction_submission_failed", s.payer);
       }
@@ -306,7 +363,8 @@ export class StellarFacilitator {
       this.safeStatus(s, "submitted", hash);
       // The fee is spent once the network admits the envelope, whatever happens afterwards.
       this.feeWindow.add(p.feeStroops);
-      sellerWindow.add(1);
+      sellerFee.add(p.feeStroops);
+      sellerCount.add(1);
 
       let final: { status: string };
       try {
@@ -401,13 +459,18 @@ export class StellarFacilitator {
       this.log("ledger lookup failed", err);
       return { ok: false, reason: "unexpected_verify_error" };
     }
-    const s = verifyStatic(payload, requirements, {
+    const ctx = {
       networkPassphrase: this.networkPassphrase,
       facilitatorAddresses: this.facilitatorAddresses,
       currentLedger,
       estimatedLedgerSeconds,
       nonceStore: this.nonces,
-    });
+    };
+    let s = verifyStatic(payload, requirements, ctx);
+    if (!s.ok && s.reason === "invalid_exact_stellar_payload_nonce_reused" && s.payer && s.nonce) {
+      // A claim that never reached the network cannot be applied once the entry has expired on chain: free it.
+      if (this.releaseStaleClaim(s.payer, s.nonce, currentLedger)) s = verifyStatic(payload, requirements, ctx);
+    }
     if (!s.ok) {
       if (s.message) this.log(`static check ${s.reason}: ${s.message}`);
       return {
@@ -418,6 +481,21 @@ export class StellarFacilitator {
       };
     }
     return s;
+  }
+
+  /** M-r3-7: a `claimed` (never submitted) row whose auth entry has expired is released. */
+  private releaseStaleClaim(payer: string, nonce: string, currentLedger: number): boolean {
+    try {
+      const rec = this.nonces.lookup(this.network, payer, nonce);
+      if (rec && rec.status === "claimed" && rec.expirationLedger > 0 && currentLedger >= rec.expirationLedger) {
+        this.log(`releasing stale claim for ${payer}: entry expired at ledger ${rec.expirationLedger}, never submitted`);
+        this.nonces.release(this.network, payer, nonce);
+        return true;
+      }
+    } catch (err) {
+      this.log("stale claim check failed", err);
+    }
+    return false;
   }
 
   /** Rebuild with this facilitator as source, simulate, inspect balance changes and fee. */
@@ -455,7 +533,7 @@ export class StellarFacilitator {
       return { ok: false, reason: "invalid_exact_stellar_payload_simulation_failed", payer: s.payer };
     }
     const settlementFee = Number.parseInt(sim.minResourceFee, 10) + this.inclusionFeeStroops;
-    if (settlementFee > this.maxTransactionFeeStroops) {
+    if (!Number.isSafeInteger(settlementFee) || settlementFee > this.maxTransactionFeeStroops) {
       this.log(`fee ${settlementFee} exceeds ceiling ${this.maxTransactionFeeStroops}`);
       return { ok: false, reason: "invalid_exact_stellar_payload_fee_exceeds_maximum", payer: s.payer };
     }
@@ -464,24 +542,19 @@ export class StellarFacilitator {
     return { ok: true, rebuilt, assemble: sim.assemble, feeStroops: settlementFee };
   }
 
-  /** Fees charged in the trailing hour (stroops) and settlements per seller; exposed for /health. */
-  usage(): { feeStroopsLastHour: number; feeBudgetStroopsPerHour: number } {
-    return { feeStroopsLastHour: this.feeWindow.total(), feeBudgetStroopsPerHour: this.feeBudgetStroopsPerHour };
-  }
-
-  private sellerWindow(payTo: string): HourWindow {
-    let w = this.sellerWindows.get(payTo);
+  private window(map: Map<string, HourWindow>, key: string): HourWindow {
+    let w = map.get(key);
     if (!w) {
-      if (this.sellerWindows.size > 10_000) this.sellerWindows.delete(this.sellerWindows.keys().next().value!);
+      if (map.size > 10_000) map.delete(map.keys().next().value!);
       w = new HourWindow(this.now);
-      this.sellerWindows.set(payTo, w);
+      map.set(key, w);
     }
     return w;
   }
 
-  private safeRelease(s: Static): void {
+  private safeRelease(payer: string, nonce: string): void {
     try {
-      this.nonces.release(this.network, s.payer, s.nonce);
+      this.nonces.release(this.network, payer, nonce);
     } catch (err) {
       this.log("nonce release failed", err);
     }
