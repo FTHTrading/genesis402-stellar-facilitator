@@ -18,11 +18,21 @@ Labels: **REAL** = runs on Stellar testnet from this repo; **TESTED** = unit tes
 | Discovery index + JSON schema; crawl manifests; list only after a real 402; `GET /discovery/resources?network=` | `packages/discovery` | **TESTED**; **NOT DEPLOYED** |
 | Reference seller and payer proving an end-to-end paid call on testnet | `examples/` | **REAL** (see the demo transcript in the T1 report) |
 | Testnet USDC | Circle testnet USDC contract `CBIELTK6…DAMA` supported and verified on Horizon; the automated demo issues `TUSDC` because Circle's faucet is a manual form | Circle USDC path: configured, **not exercised by the automated demo**; `TUSDC`: **DEMO** |
-| Tests: ≥25 vitest tests incl. six negative cases; testnet integration behind an env flag; crawler test with a mock seller; CI | 84 unit tests at the r1 review baseline (52b2e34), 122 at HEAD, plus 1 opt-in integration test, `.github/workflows/ci.yml` | **TESTED**; CI state is in the T1 report |
-| Review round r1 (failure-path reviewer, 2026-10-23): 6 Important + 10 Minor findings | all fixed test-first except one reviewer test that contradicts the replay rule (see T1 report, "Fixes r1") | **TESTED** |
+| Tests: ≥25 vitest tests incl. six negative cases; testnet integration behind an env flag; crawler test with a mock seller; CI | 84 unit tests at the r1 review baseline (52b2e34), 151 at HEAD, plus 1 opt-in integration test, `.github/workflows/ci.yml` | **TESTED**; CI state is in the T1 report |
+| Review round r1 (failure-path reviewer, 2026-10-23): 6 Important + 10 Minor findings | all fixed test-first; the reviewer retired the one r1 test that contradicted the replay rule | **TESTED** |
+| Review round r2 (2026-10-23): 1 Critical (paywall bypass introduced by r1), 3 Important, 5 Minor; threat-model DoS.6 and Elevation.4 | all fixed test-first (claimant-keyed settlement, bounded critical section, rightmost-hop proxy identity, pending expiry, method binding, fee-drain guard, optional seller bearer auth); one reviewer test asserts delivery after a seller restart, which the reviewer's own text and M-r2-1 call a documented limit (see T1 report, "Fixes r2") | **TESTED** |
 | Docs: README, ARCHITECTURE.md (Mermaid), SECURITY.md (STRIDE), this file | repo root, `docs/` | written |
 
-Out of T1 scope and **ABSENT** here: Soroban settlement contract, mainnet, token issuance, any bridge, marketing copy.
+Out of T1 scope and **ABSENT** in T1: Soroban settlement contract, mainnet, token issuance, any bridge, marketing copy.
+
+## T2 — settlement contract (branch `t2/settlement-contract`, testnet only, $0)
+
+| Item | Delivered | State |
+|---|---|---|
+| Soroban contract `x402-settle`: `settle(payer, seller, token, amount, fee, nonce, expiry_ledger, facilitator)`, `is_settled`, `version`; payer `require_auth`, persistent `(payer, nonce)` guard with TTL extension, expiry check, flat fee split only when `fee > 0`, `settled` event, no admin or upgrade key | `contracts/x402-settle` | **TESTED on testnet**: `CA5LF4WBEXMFGX4BQCSLVEXVV6U3AUIQ55KNTSIQVD3HDEXAEEWFE5BC` (`contracts/x402-settle/DEPLOY-TESTNET.md`); **NOT DEPLOYED to mainnet** |
+| 20 Rust unit tests (success, replay, expired, wrong auth, zero and negative amount, insufficient balance, fee arithmetic, event) | `contracts/x402-settle/src/test.rs`, `cargo test` | **TESTED** |
+| Node integration test on testnet (`T2_TESTNET=1`): deploy, fund with the DEMO asset, settle once with a fee, read `is_settled`, replay refused on chain | `contracts/x402-settle/test/testnet.integration.test.ts` | **TESTED on testnet** (transcript in the T2 report) |
+| Facilitator switch from direct token transfer to the contract | `docs/T2-contract-path.md` | design only; **not yet wired** |
 
 ## After award — tranches (from the application; nothing below exists yet)
 
@@ -40,4 +50,4 @@ Count of settled x402 payments on Stellar through this facilitator (transaction 
 
 - The demo issues an asset: `TUSDC`, from a throwaway testnet issuer, per run. It has no value and exists only because Circle's testnet faucet is a manual form. No other token is issued anywhere in this project. Replace it with Circle testnet USDC by funding the payer at faucet.circle.com; the code path is identical.
 - "Bazaar-style" means the manifest and index use the same field pattern as the Coinbase x402 Bazaar (resource, price, lane, schema). This index is not operated by Coinbase and is not listed there.
-- Hosted Stellar x402 facilitators exist (OpenZeppelin Relayer plugin, Vellar). This project's distinct parts are the self-hostable facilitator with a tested verifier, the chain-aware discovery index with a live-402 listing rule, and the seller catalogue that gives it day-one content.
+- Stellar x402 facilitators already exist and this project is not the first or the only one. Known as of 2026-10-23: the Coinbase-run facilitator at [x402.org/facilitator](https://x402.org/facilitator/supported) advertises `stellar:testnet` with sponsored fees (its `/supported` was read on that date); [Openx402 by Ithaca-Labs](https://github.com/Ithaca-Labs/openx402) (Apache-2.0, `stellar:testnet` preview, Bazaar-style discovery and a proposed `upto` scheme); the OpenZeppelin Relayer plugin; and Vellar. The official Stellar scheme package is [`@x402/stellar`](https://www.npmjs.com/package/@x402/stellar) (2.28.0 on 2026-10-23, Apache-2.0, repo `x402-foundation/x402`). What this repository adds is one self-hostable implementation whose verifier, settlement contract and discovery listing rule are each covered by tests you can run, plus the seller catalogue that gives the index day-one content.
