@@ -5,11 +5,16 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": "./dist/index.js" },
-  "scripts": { "start": "tsx src/server.ts" },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts"
+  },
   "dependencies": {
     "@hono/node-server": "^2.1.5",
     "hono": "^4.13.13",
-    "zod": "^4.6.7"
+    "zod": "^4.6.7",
+    "@genesis402/stellar-seller-sdk": "0.1.0"
   }
 }
