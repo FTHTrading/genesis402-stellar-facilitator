@@ -23,7 +23,7 @@ binding = "DB"
 database_name = "g402-faucet"
 # Local `wrangler dev` uses a local SQLite file and ignores this id.
 # Before the first deploy, create the database (DEPLOY.md step 2) and put its id here.
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "3b66f311-b3ec-4a25-ae43-417670c440b1"
 
 [vars]
 CLAIMS_PER_ADDRESS = "1"
