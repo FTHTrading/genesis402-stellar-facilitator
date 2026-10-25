@@ -127,7 +127,7 @@ async function main(): Promise<void> {
   );
   const lockHash = await classic(
     issuer,
-    [Operation.setOptions({ masterWeight: 0, lowThreshold: 1, medThreshold: 1, highThreshold: 1 })],
+    [Operation.setOptions({ homeDomain: "faucet.genesis402.com", masterWeight: 0, lowThreshold: 1, medThreshold: 1, highThreshold: 1 })],
     "issuer locked",
   );
 

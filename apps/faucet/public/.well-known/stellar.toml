@@ -1,0 +1,23 @@
+# Genesis402 testnet faucet (UnyKorn LLC). Stellar TESTNET only. These tokens have no value.
+VERSION = "2.7.0"
+NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+ACCOUNTS = ["GBBGYXEO4DFKSLWT2GHPWZUTH6BDP4V4Z5RZMWNKRXOHMGJ6V2IDHRDY"]
+
+[DOCUMENTATION]
+ORG_NAME = "UnyKorn LLC"
+ORG_URL = "https://genesis402.com"
+ORG_LOGO = "https://faucet.genesis402.com/g402t-256.png"
+ORG_DESCRIPTION = "Genesis402 is an x402 payment rail operated by UnyKorn LLC (Wyoming). This faucet hands out Stellar testnet tokens for trying it."
+ORG_OFFICIAL_EMAIL = "kevan@unykorn.org"
+
+[[CURRENCIES]]
+code = "G402T"
+issuer = "GDJIYLQDNCT4QFW7SEBE4KUIQA6KLYHNNUUD2RBOUCLZPYTJSIT6ZSMJ"
+contract = "CAO4LRADWFCLUUA7GL6SKD5Z7JMACAVYINF46N7WXRZ2PMXZ5OYJ6FGO"
+status = "test"
+display_decimals = 2
+name = "G402T test token"
+desc = "Fixed-supply Stellar testnet token for trying Genesis402 x402 payments. Testnet only. These tokens have no value. The issuer is locked, so no more can be created."
+fixed_number = 1000000000
+is_asset_anchored = false
+image = "https://faucet.genesis402.com/g402t-256.png"
