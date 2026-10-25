@@ -245,6 +245,41 @@ async function addTrustline(i: Info, kp: Keypair, sequence: string): Promise<str
   return body.hash;
 }
 
+const DONE_LABEL = "Done — make another tomorrow";
+
+function txList(txs: Array<[string, string]>): HTMLElement {
+  return el("ul", { className: "tx-list" }, ...txs.map(([label, url]) => el("li", {}, link(url, label))));
+}
+
+/**
+ * The generated wallet: address, secret and the testnet warning. Shown after a full run, and also
+ * when a later step fails after Friendbot funded the account, so the funded wallet is never lost.
+ */
+function walletCard(kp: Keypair, txs: Array<[string, string]>, complete: boolean): Node[] {
+  const nodes: Node[] = [
+    el("h3", { textContent: complete ? "Your test wallet" : "Your test wallet (not finished)" }),
+    copyRow("Address", kp.publicKey()),
+    copyRow("Secret key", kp.secret(), { secret: true }),
+    el(
+      "p",
+      { className: "warn" },
+      el("strong", { textContent: "Testnet only. These tokens have no value." }),
+      " This secret key was made in your browser and never sent to us. Do not reuse it for anything else. Anyone who sees it controls this test wallet.",
+    ),
+  ];
+  if (!complete) {
+    nodes.push(
+      el("p", {
+        textContent:
+          "This wallet already has test XLM. Save the secret key now. To finish, add the G402T trustline in a wallet app, then paste the address into the Get 1,000 G402T card.",
+      }),
+    );
+  }
+  nodes.push(el("p", {}, link(`${EXPLORER_ACCOUNT}${kp.publicKey()}`, "Open the wallet on stellar.expert")));
+  if (txs.length) nodes.push(txList(txs));
+  return nodes;
+}
+
 function setupWallet(): void {
   const btn = $<HTMLButtonElement>("#wallet-btn");
   const steps = $("#wallet-steps");
@@ -267,15 +302,19 @@ function setupWallet(): void {
     }
     let current: Step = "keys";
     const txs: Array<[string, string]> = [];
+    let kp: Keypair | null = null;
+    let funded = false;
+    let finished = false;
     try {
       mark("keys", "doing");
-      const kp = Keypair.random();
+      kp = Keypair.random();
       mark("keys", "done", `${kp.publicKey().slice(0, 6)}...${kp.publicKey().slice(-6)}`);
 
       current = "xlm";
       mark("xlm", "doing");
       const x = await claim("xlm", kp.publicKey());
       if (!x.body.ok) throw new Error(x.body.message ?? "Friendbot did not fund the account.");
+      funded = true;
       if (x.body.explorer) txs.push(["Test XLM", x.body.explorer]);
       mark("xlm", "done", "10,000 test XLM");
 
@@ -297,27 +336,28 @@ function setupWallet(): void {
       if (g.body.explorer) txs.push(["1,000 G402T", g.body.explorer]);
       mark("g402t", "done", "1,000 G402T");
 
-      result.append(
-        el("h3", { textContent: "Your test wallet" }),
-        copyRow("Address", kp.publicKey()),
-        copyRow("Secret key", kp.secret(), { secret: true }),
-        el(
-          "p",
-          { className: "warn" },
-          el("strong", { textContent: "Testnet only. These tokens have no value." }),
-          " This secret key was made in your browser and never sent to us. Do not reuse it for anything else. Anyone who sees it controls this test wallet.",
-        ),
-        el("p", {}, link(`${EXPLORER_ACCOUNT}${kp.publicKey()}`, "Open the wallet on stellar.expert")),
-        el("ul", { className: "tx-list" }, ...txs.map(([label, url]) => el("li", {}, link(url, label)))),
-      );
+      result.append(...walletCard(kp, txs, true));
       result.hidden = false;
+      finished = true;
     } catch (err) {
       mark(current, "failed");
-      const extra = txs.length ? el("ul", { className: "tx-list" }, ...txs.map(([label, url]) => el("li", {}, link(url, label)))) : undefined;
-      showError(errorBox, (err as Error).message, extra);
+      if (funded && kp) {
+        // Friendbot already funded this keypair: show it, or the funded wallet is lost with the tab.
+        result.append(...walletCard(kp, txs, false));
+        result.hidden = false;
+        showError(errorBox, (err as Error).message);
+      } else {
+        showError(errorBox, (err as Error).message, txs.length ? txList(txs) : undefined);
+      }
     } finally {
-      btn.disabled = false;
-      btn.textContent = "Make me another test wallet";
+      if (finished || funded) {
+        // Test XLM is one claim per network per day, so another run today would stop at step 2.
+        btn.disabled = true;
+        btn.textContent = DONE_LABEL;
+      } else {
+        btn.disabled = false;
+        btn.textContent = "Try again";
+      }
     }
   });
 }

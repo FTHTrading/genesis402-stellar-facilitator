@@ -76,6 +76,33 @@ npx wrangler delete g402-faucet
 `wrangler delete` does not delete the D1 database or touch testnet balances. To drop the database too: `npx wrangler d1 delete g402-faucet`.
 Stopping the G402T side alone: `npx wrangler secret delete DISTRIBUTOR_SECRET` (test XLM keeps working).
 
+## Limits
+
+| Limit | Default | Where |
+|---|---|---|
+| Claims per address per token | 1 per 24 h | `CLAIMS_PER_ADDRESS` in `wrangler.toml` |
+| Claims per network per token (IPv4 /32, IPv6 /64) | 1 per 24 h | `CLAIMS_PER_IP` in `wrangler.toml` |
+| G402T claims for the whole faucet | 1,000 per UTC day (1,000,000 G402T) | `globalPerDay` in `src/ratelimit.ts`; `globalLimitsFromEnv()` reads an env var value but `src/worker.ts` does not pass one yet, so the default applies |
+| Tries per network per token (counted even when nothing is sent) | 5 per hour | `attemptsPerHour` in `src/ratelimit.ts` |
+
+All four live in the same `claim_counters` D1 table, keys `<token>|a|<address>`, `<token>|i|<network>`, `g402t|g|<YYYY-MM-DD>` and `<token>|t|<network>`.
+
+## Testnet reset
+
+Stellar testnet resets periodically (SDF announces each reset ahead of time). A reset wipes every testnet account, so the G402T issuer, the distributor and both SAC contracts in `testnet-asset.json` stop existing. Symptoms after a reset: G402T claims answer `faucet_empty` (the distributor account is gone) and the stellar.expert links in the page show "account not found".
+
+Recovery:
+
+1. Move the old files aside (the setup script refuses to run while either exists, so nothing is overwritten by accident):
+   - `testnet-asset.json` to `testnet-asset.<reset-date>.json`
+   - `C:\Users\Kevan\.unykorn\secrets\g402-faucet-testnet.env` to `g402-faucet-testnet.<reset-date>.env` (same folder; do not print it)
+2. Re-run `scripts/setup-testnet.ts` (`npm run setup:testnet`). It creates a new issuer, distributor and SAC addresses, writes a new secrets env file and a new `testnet-asset.json`.
+3. Check the new `testnet-asset.json` (issuer, distributor, SAC addresses) and commit it. Update the issuer and SAC values listed under "Verify what is served" above.
+4. Reload the distributor secret: `npx wrangler secret bulk C:/Users/Kevan/.unykorn/secrets/g402-faucet-testnet.env`.
+5. Redeploy so the Worker serves the new `testnet-asset.json`: `npm test`, then `npx wrangler deploy` (after Kevan's go, same as a first deploy).
+6. Optional: clear old rate-limit rows with `npx wrangler d1 execute g402-faucet --remote --command "DELETE FROM claim_counters"`.
+7. Verify served: `/api/info` shows the new issuer and `g402tReady: true`, and one claim from the page lands on stellar.expert.
+
 ## Refill / recovery
 
 The distributor holds the whole fixed supply (1,000,000,000 G402T, 1,000 per claim). The issuer is locked (master weight 0), so supply can never grow; if the distributor ever runs dry the faucet answers `faucet_empty`. Recovery would mean issuing a new test asset with `npm run setup:testnet` (refuses to run while `testnet-asset.json` or the secrets env file exists).

@@ -28,6 +28,7 @@ database_id = "00000000-0000-0000-0000-000000000000"
 [vars]
 CLAIMS_PER_ADDRESS = "1"
 CLAIMS_PER_IP = "1"
+G402T_CLAIMS_PER_DAY = "1000"
 
 [observability]
 enabled = true

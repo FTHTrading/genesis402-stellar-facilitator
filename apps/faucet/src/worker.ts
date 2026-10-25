@@ -1,6 +1,6 @@
 import asset from "../testnet-asset.json";
 import { createFaucet, type FaucetConfig } from "./faucet.js";
-import { ClaimLimiter, type SqlDb } from "./ratelimit.js";
+import { ClaimLimiter, globalLimitsFromEnv, type SqlDb } from "./ratelimit.js";
 
 export interface Env {
   DB: D1Database;
@@ -9,6 +9,8 @@ export interface Env {
   DISTRIBUTOR_SECRET?: string;
   CLAIMS_PER_ADDRESS?: string;
   CLAIMS_PER_IP?: string;
+  /** Global G402T claims per UTC day (default 1000). */
+  G402T_CLAIMS_PER_DAY?: string;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -41,6 +43,7 @@ function faucetFor(env: Env) {
     windowMs: DAY_MS,
     perAddress: positiveInt(env.CLAIMS_PER_ADDRESS, 1),
     perIp: positiveInt(env.CLAIMS_PER_IP, 1),
+    globalPerDay: globalLimitsFromEnv(env.G402T_CLAIMS_PER_DAY),
   });
   const faucet = createFaucet({
     config,

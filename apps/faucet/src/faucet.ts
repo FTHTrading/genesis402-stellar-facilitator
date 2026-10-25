@@ -1,7 +1,7 @@
 import { Account, Asset, Keypair, Memo, Operation, TransactionBuilder } from "@stellar/stellar-sdk/base";
 import { checkAddress } from "./address.js";
 import { MSG, humanDuration } from "./messages.js";
-import type { ClaimLimiter } from "./ratelimit.js";
+import type { ClaimLimiter, LimitScope } from "./ratelimit.js";
 
 /** Fixed server-side. Nothing in a request can change the amount, asset, source or destination (S1). */
 export const G402T_CLAIM_AMOUNT = "1000";
@@ -115,7 +115,25 @@ export function createFaucet(deps: FaucetDeps) {
     | { kind: "ok"; hash: string }
     | { kind: "rejected"; codes: unknown }
     | { kind: "pending"; hash: string }
+    | { kind: "not_sent"; status: number }
     | { kind: "bad_seq" };
+
+  /**
+   * Called once when the submit outcome is unknown (504, network error). Horizon knows a
+   * transaction only after it is in a ledger, so 404 here still means "unknown", not "not sent".
+   */
+  async function lookupTransaction(hash: string): Promise<"applied" | "failed" | "unknown"> {
+    try {
+      const res = await doFetch(`${config.horizonUrl}/transactions/${hash}`, { headers: { accept: "application/json" } });
+      if (!res.ok) return "unknown";
+      const body = (await res.json().catch(() => null)) as { successful?: unknown } | null;
+      if (body?.successful === true) return "applied";
+      if (body?.successful === false) return "failed";
+      return "unknown";
+    } catch {
+      return "unknown";
+    }
+  }
 
   async function submitPayment(distributorAcct: HorizonAccount, destination: string): Promise<SubmitOutcome> {
     if (!signer) throw new Error("unreachable: no signer");
@@ -138,7 +156,7 @@ export function createFaucet(deps: FaucetDeps) {
       });
     } catch {
       // The request may or may not have reached Horizon: treat as unknown, never as "nothing sent".
-      return { kind: "pending", hash };
+      return settleUnknown(hash);
     }
     if (res.ok) {
       const body = (await res.json().catch(() => ({}))) as { hash?: string };
@@ -150,15 +168,26 @@ export function createFaucet(deps: FaucetDeps) {
       if (codes?.transaction === "tx_bad_seq") return { kind: "bad_seq" };
       return { kind: "rejected", codes: codes ?? null };
     }
+    // 429 (rate limited) and 503 (busy): Horizon refused the request before it reached the network.
+    if (res.status === 429 || res.status === 503) return { kind: "not_sent", status: res.status };
     // 504 and other gateway errors: the transaction may still be applied.
+    return settleUnknown(hash);
+  }
+
+  async function settleUnknown(hash: string): Promise<SubmitOutcome> {
+    const seen = await lookupTransaction(hash);
+    if (seen === "applied") return { kind: "ok", hash };
+    if (seen === "failed") return { kind: "rejected", codes: { transaction: "tx_failed" } };
     return { kind: "pending", hash };
   }
 
   async function readAddress(request: Request): Promise<{ address: string } | Response> {
     const ctype = request.headers.get("content-type") ?? "";
     if (!/^application\/json\b/i.test(ctype)) return fail(415, "unsupported_media_type", MSG.needJson);
-    const text = await request.text();
-    if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) return fail(413, "too_large", MSG.tooLarge);
+    const declared = request.headers.get("content-length");
+    if (declared !== null && !(Number(declared) <= MAX_BODY_BYTES)) return fail(413, "too_large", MSG.tooLarge);
+    const text = await readCapped(request, MAX_BODY_BYTES);
+    if (text === null) return fail(413, "too_large", MSG.tooLarge);
     let body: unknown;
     try {
       body = JSON.parse(text);
@@ -172,11 +201,36 @@ export function createFaucet(deps: FaucetDeps) {
     return { address: check.address };
   }
 
+  /** Reads at most `max` bytes of the body; returns null (and stops reading) once it is longer. */
+  async function readCapped(request: Request, max: number): Promise<string | null> {
+    if (!request.body) return "";
+    const reader = request.body.getReader();
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      parts.push(value);
+    }
+    const all = new Uint8Array(total);
+    let at = 0;
+    for (const p of parts) {
+      all.set(p, at);
+      at += p.byteLength;
+    }
+    return new TextDecoder().decode(all);
+  }
+
   function clientIp(request: Request): string {
     return request.headers.get("cf-connecting-ip")?.trim() || "unknown";
   }
 
-  function rateLimited(what: string, scope: "address" | "ip", retryAfterSec: number): Response {
+  function rateLimited(what: string, scope: LimitScope, retryAfterSec: number): Response {
     return fail(
       429,
       "rate_limited",
@@ -276,6 +330,11 @@ export function createFaucet(deps: FaucetDeps) {
             hash: outcome.hash,
             explorer: `${config.explorerTxBase}${outcome.hash}`,
           });
+        }
+        if (outcome.kind === "not_sent") {
+          await slot.release();
+          log(`g402t: horizon HTTP ${outcome.status} on submit for ${address}, nothing sent`);
+          return fail(503, "horizon_busy", MSG.horizonBusy, {}, { "retry-after": "30" });
         }
         if (outcome.kind === "rejected") {
           await slot.release();

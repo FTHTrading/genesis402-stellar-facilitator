@@ -21,13 +21,18 @@ export const MSG = {
   friendbotUnavailable: "Stellar Friendbot did not answer. Nothing was sent. Please try again in a minute.",
   submitFailed: "The testnet rejected the payment. Nothing was sent. Please try again in a minute.",
   submitPending:
-    "The payment was sent but the testnet has not confirmed it yet. Check the transaction link in a minute; do not claim again.",
+    "The payment may have been sent; the testnet has not confirmed it yet. Check the transaction link before trying again.",
+  horizonBusy: "The Stellar testnet server (Horizon) is busy, try again shortly. No payment was made.",
   alreadyFunded:
     "Friendbot declined this address (it usually means the account is already funded). Nothing was sent.",
-  rateLimited: (what: string, scope: "address" | "ip", retry: string) =>
+  rateLimited: (what: string, scope: "address" | "ip" | "global" | "attempts", retry: string) =>
     scope === "address"
       ? `This address already received ${what} in the last 24 hours. Try again in ${retry}.`
-      : `This network already received ${what} in the last 24 hours. Try again in ${retry}.`,
+      : scope === "ip"
+        ? `This network already received ${what} in the last 24 hours. Try again in ${retry}.`
+        : scope === "global"
+          ? `The faucet has reached its daily limit for ${what}. It opens again at midnight UTC, in ${retry}.`
+          : `Too many tries from this network in the last hour. Nothing was sent. Try again in ${retry}.`,
   badJson: "Send a JSON body like {\"address\": \"G...\"}.",
   needJson: "Send the request as application/json.",
   tooLarge: "Request body is too large.",
