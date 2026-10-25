@@ -1,0 +1,31 @@
+{
+  "name": "@genesis402/faucet",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Genesis402 Stellar testnet faucet: test XLM via Friendbot, 1,000 G402T test tokens, one-click test wallet. Testnet only.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "wrangler dev --env-file C:/Users/Kevan/.unykorn/secrets/g402-faucet-testnet.env",
+    "test": "vitest run",
+    "test:testnet": "FAUCET_TESTNET_TESTS=1 vitest run",
+    "typecheck": "tsc --noEmit",
+    "setup:testnet": "tsx scripts/setup-testnet.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "17.3.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261008.1",
+    "@types/node": "24.7.0",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5",
+    "wrangler": "4.149.0"
+  }
+}

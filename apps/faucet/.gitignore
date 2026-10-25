@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+public/app.js
+public/app.js.map
+.dev.vars
+*.env
