@@ -23,7 +23,7 @@ export const MSG = {
   submitPending:
     "The payment was sent but the testnet has not confirmed it yet. Check the transaction link in a minute; do not claim again.",
   alreadyFunded:
-    "This account already exists on testnet and has XLM. Friendbot funds new accounts, so nothing more is needed.",
+    "Friendbot declined this address (it usually means the account is already funded). Nothing was sent.",
   rateLimited: (what: string, scope: "address" | "ip", retry: string) =>
     scope === "address"
       ? `This address already received ${what} in the last 24 hours. Try again in ${retry}.`

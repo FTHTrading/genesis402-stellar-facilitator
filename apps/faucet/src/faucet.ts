@@ -228,7 +228,7 @@ export function createFaucet(deps: FaucetDeps) {
     const { address } = parsed;
     if (!signer) return fail(503, "not_configured", MSG.notConfigured);
     const slot = await limiter.reserve("g402t", address, clientIp(request), now());
-    if (!slot.ok) return rateLimited(`${G402T_CLAIM_AMOUNT} ${config.asset.code}`, slot.scope, slot.retryAfterSec);
+    if (!slot.ok) return rateLimited(`${Number(G402T_CLAIM_AMOUNT).toLocaleString("en-US")} ${config.asset.code}`, slot.scope, slot.retryAfterSec);
 
     try {
       const dest = await loadAccount(address);

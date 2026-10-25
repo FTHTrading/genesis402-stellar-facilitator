@@ -80,6 +80,10 @@ html {
   -webkit-text-size-adjust: 100%;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -420,6 +424,8 @@ code,
   font-weight: 600;
 }
 .alert-close {
+  flex: 0 0 auto;
+  white-space: nowrap;
   appearance: none;
   border: 1px solid currentColor;
   background: transparent;
