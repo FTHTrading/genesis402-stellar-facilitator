@@ -59,7 +59,7 @@ class World {
       const next = this.submitResponses.shift();
       if (next) return json(next.body, next.status);
       this.seq += 1n;
-      return json({ hash: tx.hash().toString("hex"), successful: true }, 200);
+      return json({ hash: Buffer.from(tx.hash()).toString("hex"), successful: true }, 200);
     }
     return json({ error: "unexpected" }, 599);
   };
@@ -158,7 +158,7 @@ describe("POST /api/claim/g402t", () => {
     expect(op.asset.getIssuer()).toBe(issuer.publicKey());
     expect(op.source).toBeUndefined();
     expect(tx.signatures).toHaveLength(1);
-    expect(distributor.verify(tx.hash(), tx.signatures[0]!.signature())).toBe(true);
+    expect(distributor.verify(tx.hash(), (tx.signatures[0] as any).signature)).toBe(true);
   });
 
   it("S1: extra fields (amount, asset, destination, source) cannot change what is sent", async () => {

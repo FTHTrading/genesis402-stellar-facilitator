@@ -1,0 +1,46 @@
+{
+  "network": "stellar:testnet",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "horizonUrl": "https://horizon-testnet.stellar.org",
+  "friendbotUrl": "https://friendbot.stellar.org",
+  "explorerTxBase": "https://stellar.expert/explorer/testnet/tx/",
+  "asset": {
+    "code": "G402T",
+    "issuer": "GDJIYLQDNCT4QFW7SEBE4KUIQA6KLYHNNUUD2RBOUCLZPYTJSIT6ZSMJ",
+    "sac": "CAO4LRADWFCLUUA7GL6SKD5Z7JMACAVYINF46N7WXRZ2PMXZ5OYJ6FGO"
+  },
+  "distributor": "GBBGYXEO4DFKSLWT2GHPWZUTH6BDP4V4Z5RZMWNKRXOHMGJ6V2IDHRDY",
+  "xlmSac": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "usdc": {
+    "sac": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+    "faucetUrl": "https://faucet.circle.com"
+  },
+  "supply": "1000000000",
+  "setup": {
+    "createdAt": "2026-10-25T18:55:23.216Z",
+    "txs": {
+      "distributorTrustline": "1fde74f0c213a88c7d443b2d8e6120e2347e362314c2a6dd437c48e951c90e1b",
+      "issue": "9a74d3082d3507f572e4ccbb9e2b687f58ae6130bcaac636f66760d58e7e922e",
+      "lockIssuer": "36c6e68fe607ac63c19b6dd85ef41528026dcb382f83988e56c86a36c88d4298",
+      "deploySac": "49ecbaa5cc78d4303fb80469279a1d578e4f4cc89f7a313c48131abd93e945b5"
+    },
+    "issuerLock": {
+      "masterWeight": 0,
+      "thresholds": {
+        "low_threshold": 1,
+        "med_threshold": 1,
+        "high_threshold": 1
+      },
+      "signers": [
+        {
+          "weight": 0,
+          "key": "GDJIYLQDNCT4QFW7SEBE4KUIQA6KLYHNNUUD2RBOUCLZPYTJSIT6ZSMJ",
+          "type": "ed25519_public_key"
+        }
+      ]
+    },
+    "distributorBalance": "1000000000.0000000",
+    "horizonAssetSupply": "1000000000.0000000",
+    "s5ProbeRefused": "S5 probe (must fail) failed: {\"transaction\":\"tx_bad_auth\"}"
+  }
+}

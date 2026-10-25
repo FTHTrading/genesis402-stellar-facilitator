@@ -1,0 +1,33 @@
+# Genesis402 Stellar testnet faucet. Testnet only.
+# Do not deploy without Kevan's "go faucet". See DEPLOY.md.
+name = "g402-faucet"
+main = "src/worker.ts"
+compatibility_date = "2025-10-01"
+workers_dev = false
+
+routes = [
+  { pattern = "faucet.genesis402.com", custom_domain = true }
+]
+
+[build]
+command = "node build.mjs"
+watch_dir = "src/client"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "g402-faucet"
+# Local `wrangler dev` uses a local SQLite file and ignores this id.
+# Before the first deploy, create the database (DEPLOY.md step 2) and put its id here.
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[vars]
+CLAIMS_PER_ADDRESS = "1"
+CLAIMS_PER_IP = "1"
+
+[observability]
+enabled = true

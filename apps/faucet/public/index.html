@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Genesis402 Testnet Faucet</title>
+  <meta name="description" content="Stellar testnet XLM and G402T test tokens for trying Genesis402 x402 payments. Testnet only. These tokens have no value.">
+  <link rel="icon" type="image/svg+xml" href="/mark.svg">
+  <link rel="preconnect" href="https://fonts.bunny.net" crossorigin>
+  <link rel="stylesheet" href="https://fonts.bunny.net/css?family=archivo:500,700,800|ibm-plex-sans:400,500,600|ibm-plex-mono:400,500&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <div class="wrap top-inner">
+      <a class="brand" href="/" aria-label="Genesis402 testnet faucet home">
+        <img src="/mark.svg" alt="" width="36" height="36">
+        <span class="brand-text"><span class="brand-name">Genesis402</span><span class="brand-sub">Stellar testnet faucet</span></span>
+      </a>
+      <button id="theme-toggle" class="btn-ghost" type="button" aria-pressed="false">Dark theme</button>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+    <section class="hero">
+      <p class="eyebrow">Stellar testnet</p>
+      <h1>Test tokens for x402 payments, one click away</h1>
+      <p class="lede">Get test XLM and the G402T test dollar, then try the Genesis402 x402 facilitator against a real testnet ledger. No sign-up, no accounts.</p>
+      <p class="notice"><strong>Testnet only. These tokens have no value.</strong></p>
+    </section>
+
+    <section class="card card-feature" aria-labelledby="wallet-title">
+      <div class="card-head">
+        <h2 id="wallet-title">Make me a test wallet</h2>
+        <span class="pill">Easiest</span>
+      </div>
+      <p>One button. Your browser creates a new Stellar keypair, funds it with 10,000 test XLM, adds the G402T trustline, and receives 1,000 G402T. The secret key is created in this tab and is never sent to our server.</p>
+      <button id="wallet-btn" class="btn" type="button" disabled>Make me a test wallet</button>
+      <ol id="wallet-steps" class="steps" hidden>
+        <li id="step-keys" data-state="todo"><span class="step-label">Create a keypair in your browser</span> <span class="step-note"></span></li>
+        <li id="step-xlm" data-state="todo"><span class="step-label">Fund it with test XLM (Friendbot)</span> <span class="step-note"></span></li>
+        <li id="step-account" data-state="todo"><span class="step-label">Wait for the account on testnet</span> <span class="step-note"></span></li>
+        <li id="step-trust" data-state="todo"><span class="step-label">Sign a G402T trustline in your browser</span> <span class="step-note"></span></li>
+        <li id="step-g402t" data-state="todo"><span class="step-label">Receive 1,000 G402T</span> <span class="step-note"></span></li>
+      </ol>
+      <div id="wallet-error" class="out" hidden></div>
+      <div id="wallet-result" class="wallet-result" hidden></div>
+    </section>
+
+    <section class="grid" aria-label="Tokens">
+      <article class="card" aria-labelledby="xlm-title">
+        <div class="card-head">
+          <h2 id="xlm-title">Get 10,000 test XLM</h2>
+          <span class="token-badge">XLM</span>
+        </div>
+        <p>Stellar Friendbot creates and funds a new testnet account. Accounts that already exist do not need it.</p>
+        <form id="form-xlm" class="claim" novalidate>
+          <label for="addr-xlm">Your testnet address</label>
+          <div class="claim-row">
+            <input id="addr-xlm" name="address" type="text" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="G..." maxlength="128" required>
+            <button class="btn" type="submit">Obtain</button>
+          </div>
+        </form>
+        <div id="out-xlm" class="out" hidden></div>
+        <dl class="details">
+          <div><dt>Asset</dt><dd>XLM (native)</dd></div>
+          <div><dt>Issuer</dt><dd>none (native asset)</dd></div>
+          <div><dt>SAC contract</dt><dd class="mono" data-field="xlm.sac">loading...</dd></div>
+        </dl>
+      </article>
+
+      <article class="card" aria-labelledby="g402t-title">
+        <div class="card-head">
+          <h2 id="g402t-title">Get 1,000 G402T</h2>
+          <span class="token-badge">G402T</span>
+        </div>
+        <p>G402T is a fixed-supply test dollar for x402 <code>exact</code> payments with the Genesis402 facilitator. The address needs a G402T trustline.</p>
+        <form id="form-g402t" class="claim" novalidate>
+          <label for="addr-g402t">Your testnet address</label>
+          <div class="claim-row">
+            <input id="addr-g402t" name="address" type="text" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="G..." maxlength="128" required>
+            <button class="btn" type="submit">Obtain</button>
+          </div>
+        </form>
+        <div id="out-g402t" class="out" hidden></div>
+        <dl class="details">
+          <div><dt>Asset code</dt><dd class="mono" data-field="g402t.code">G402T</dd></div>
+          <div><dt>Issuer</dt><dd class="mono"><a data-account-link="issuer" href="#" target="_blank" rel="noopener noreferrer"><span data-field="g402t.issuer">loading...</span></a></dd></div>
+          <div><dt>SAC contract</dt><dd class="mono" data-field="g402t.sac">loading...</dd></div>
+          <div><dt>Supply</dt><dd>1,000,000,000, fixed. The issuer is locked, so no more can be created.</dd></div>
+        </dl>
+      </article>
+
+      <article class="card" aria-labelledby="usdc-title">
+        <div class="card-head">
+          <h2 id="usdc-title">Circle testnet USDC</h2>
+          <span class="token-badge">USDC</span>
+        </div>
+        <p>Circle runs its own testnet faucet with a short form. Pick Stellar testnet there and paste your address. Add a USDC trustline before you request it.</p>
+        <p><a class="btn btn-outline" href="https://faucet.circle.com" target="_blank" rel="noopener noreferrer">Open faucet.circle.com</a></p>
+        <dl class="details">
+          <div><dt>Asset code</dt><dd class="mono">USDC</dd></div>
+          <div><dt>Issuer</dt><dd class="mono" title="GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5">GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5</dd></div>
+          <div><dt>SAC contract</dt><dd class="mono" data-field="usdc.sac">CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA</dd></div>
+        </dl>
+      </article>
+    </section>
+
+    <section class="card how" aria-labelledby="how-title">
+      <h2 id="how-title">Using the tokens with x402</h2>
+      <p>The Genesis402 facilitator settles x402 <code>exact</code> payments on Stellar through each asset's Stellar Asset Contract (SAC). Put the SAC address from the cards above in your payment requirements as the asset. G402T and Circle testnet USDC both work on testnet.</p>
+      <p class="muted">Limits: one claim of each token per address and per network every 24 hours.</p>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div class="wrap">
+      <p>Genesis402 is a product of UnyKorn LLC. <strong>Testnet only. These tokens have no value.</strong></p>
+    </div>
+  </footer>
+</body>
+</html>

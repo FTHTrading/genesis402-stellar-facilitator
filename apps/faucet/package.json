@@ -13,7 +13,7 @@
     "dev": "wrangler dev --env-file C:/Users/Kevan/.unykorn/secrets/g402-faucet-testnet.env",
     "test": "vitest run",
     "test:testnet": "FAUCET_TESTNET_TESTS=1 vitest run",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p src/client",
     "setup:testnet": "tsx scripts/setup-testnet.ts"
   },
   "dependencies": {
